@@ -1595,18 +1595,6 @@ int main(int argc, char** argv)
             {
                 first_lidar_time = Measures.lidar_beg_time;
                 p_imu->first_lidar_time = first_lidar_time;
-                static bool initpose_applied = false;
-                if (has_ndt_init_pose && !initpose_applied)
-                {
-                    state_point = kf.get_x();
-                    state_point.rot = ndt_init_q.normalized();
-                    state_point.pos = ndt_init_t;
-                    kf.change_x(state_point);
-                    euler_cur = SO3ToEuler(state_point.rot);
-                    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-                    initpose_applied = true;
-                    ROS_INFO("[initpose] Applied /initpose as initial EKF state (first frame only).");
-                }
                 flg_first_scan = false;
                 continue;
             }
@@ -1641,7 +1629,6 @@ int main(int argc, char** argv)
 
             // 首帧初始化 ikdtree/全局对齐逻辑（保持你的原样，略去中间未改动部分）
             static bool g_first_global_align_done_local = false;
-            const bool enable_init_ndt = false;
             if (ikdtree.Root_Node == nullptr) {
                 if (feats_down_size > 5) {
                     ikdtree.set_downsample_param(filter_size_map_min);
@@ -1651,7 +1638,7 @@ int main(int argc, char** argv)
                     }
                     ikdtree.Build(feats_down_world->points);
 
-                    if (enable_init_ndt && !g_first_global_align_done_local && g_global_map_ready && !g_global_map_ds->empty()) {
+                    if (!g_first_global_align_done_local && g_global_map_ready && !g_global_map_ds->empty()) {
                         try {
                             pcl::PointCloud<PointType>::Ptr src(new pcl::PointCloud<PointType>(*feats_down_world));
                             pcl::PointCloud<PointType>::Ptr tgt(new pcl::PointCloud<PointType>(*g_global_map_ds));

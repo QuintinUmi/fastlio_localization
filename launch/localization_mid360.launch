@@ -2,6 +2,7 @@
 <!-- Launch file for Livox MID360 LiDAR -->
 
 	<arg name="rviz" default="true" />
+	<arg name="initpose" default="true" />
 
 	<rosparam command="load" file="$(find fastlio_localization)/config/mid360.yaml" />
 	<rosparam command="load" file="$(find fastlio_localization)/config/localization.yaml" />
@@ -16,7 +17,13 @@
     <node pkg="fastlio_localization" type="fastlio_mapping" name="laserMapping" output="screen" /> 
 
 	<group if="$(arg rviz)">
-	<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fastlio_localization)/rviz_cfg/loam_livox.rviz" />
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fastlio_localization)/rviz_cfg/loam_livox2.rviz" />
+	</group>
+
+	<group if="$(arg initpose)">
+		<param name="init_pose/position" value="0.0 0.0 0.0" />
+		<param name="init_pose/orientation" value="0.0 0.0 0.0 1.0" />
+		<node pkg="fastlio_localization" type="publish_init_pose.py" name="init_pose_pub" output="screen" />
 	</group>
 
 </launch>

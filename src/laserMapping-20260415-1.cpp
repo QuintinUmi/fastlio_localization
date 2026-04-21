@@ -115,14 +115,76 @@ struct LocalizationParams {
 };
 LocalizationParams g_loc;
 
+// ===== 后端定位线程相关 =====
+struct BackendConfig {
+    bool enable = false;                    // 是否启用后端
+    int min_local_points = 50000;           // 触发条件：local tree 最小点数
+    float min_local_radius = 30.0f;         // 触发条件：local map 最小半径
+    int min_frames = 100;                   // 触发条件：最小运行帧数
+    
+    float submap_radius = 25.0f;            // submap 提取半径
+    float submap_voxel_size = 0.4f;         // submap 降采样
+    
+    int update_interval = 5;                // 每 N 帧更新一次
+    float max_point2plane_dist = 1.5f;      // 点到面最大距离
+    float global_residual_weight = 3.0f;    // 全局残差权重
+    int max_global_points = 2000;           // 最大全局点数
+};
+BackendConfig g_backend_cfg;
+
+struct BackendState {
+    bool is_active = false;                 // 是否已激活
+    bool is_running = false;                // 线程是否在运行
+    int frame_count = 0;                    // 总帧数
+    int update_count = 0;                   // 更新计数
+    
+    // 后端优化结果
+    state_ikfom global_state;               // 全局地图中的位姿
+    bool has_global_state = false;          // 是否有有效全局状态
+    
+    // 统计
+    int total_updates = 0;
+    int successful_updates = 0;
+} g_backend_state;
+
+// 后端线程通信
+std::mutex mtx_backend;
+std::condition_variable cv_backend;
+std::thread backend_thread;
+bool backend_should_stop = false;
+
+// 后端数据队列
+struct BackendData {
+    state_ikfom frontend_state;             // 前端状态
+    PointCloudXYZI::Ptr submap;             // 提取的 submap
+    double timestamp;                       // 时间戳
+};
+std::deque<BackendData> backend_queue;
+const int MAX_BACKEND_QUEUE_SIZE = 5;       // 队列最大长度
+
+// 后端 EKF 实例
+esekfom::esekf<state_ikfom, 12, input_ikfom> kf_backend;
+
 pcl::PointCloud<PointType>::Ptr g_global_map_raw(new pcl::PointCloud<PointType>());
 pcl::PointCloud<PointType>::Ptr g_global_map_ds(new pcl::PointCloud<PointType>());
-pcl::KdTreeFLANN<PointType>::Ptr g_kdtree_global(new pcl::KdTreeFLANN<PointType>());
+
+
+// ===== 后端可视化全局变量 =====
+PointCloudXYZI::Ptr g_current_submap(new PointCloudXYZI());
+PointCloudXYZI::Ptr g_current_submap_global(new PointCloudXYZI());  // 全局坐标系下的 submap
+PointCloudXYZI::Ptr g_current_scan_global(new PointCloudXYZI());    // 全局坐标系下的当前帧
+state_ikfom g_submap_anchor_frontend_state; // 提取当前 submap 时对应的前端 local 位姿锚点
+Eigen::Isometry3d g_T_map_local = Eigen::Isometry3d::Identity(); // local -> map
+std::atomic_bool  g_has_T_map_local{false};
+std::mutex        g_mtx_TmapLocal; // 若你不想用 atomic，也可以只靠这个互斥
+std::mutex mtx_backend_vis;  // 保护可视化数据
 
 // 标记是否加载成功
 bool g_global_map_ready = false;
 bool g_first_global_align_done = false;
 bool g_global_ikdtree_ready = false;
+double g_backend_residual_mean = 0.0;
+int g_backend_effective_points = 0;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = 0, last_timestamp_imu = -1.0;
@@ -296,9 +358,11 @@ void ndtInitPoseCallback(const nav_msgs::OdometryConstPtr& msg){
     ndt_init_t.z() = msg->pose.pose.position.z;
 
     has_ndt_init_pose = true;
-    ROS_INFO("[NDT Init] Received pose: (%.3f, %.3f, %.3f)", 
-        ndt_init_t.x(), ndt_init_t.y(), ndt_init_t.z()
-    );
+    ROS_WARN("[NDT Init] ===== RECEIVED INIT POSE =====");
+    ROS_INFO("[NDT Init] Position: (%.3f, %.3f, %.3f)", 
+        ndt_init_t.x(), ndt_init_t.y(), ndt_init_t.z());
+    ROS_INFO("[NDT Init] Quaternion: (%.3f, %.3f, %.3f, %.3f)",
+        ndt_init_q.x(), ndt_init_q.y(), ndt_init_q.z(), ndt_init_q.w());
 }
 
 
@@ -717,16 +781,25 @@ bool LoadGlobalMapAndBuildIndex()
         ROS_WARN("[localization] map_file_path is empty, skip loading global map.");
         return false;
     }
+    
     ROS_INFO("[localization] Loading global map: %s", g_loc.map_file_path.c_str());
+    
+    // 加载 PCD
     if (pcl::io::loadPCDFile<PointType>(g_loc.map_file_path, *g_global_map_raw) != 0) {
         ROS_ERROR("[localization] Failed to load PCD: %s", g_loc.map_file_path.c_str());
         return false;
     }
+    
+    ROS_INFO("[localization] Loaded %zu points from PCD", g_global_map_raw->size());
+    
     // 体素降采样
     pcl::VoxelGrid<PointType> vg;
     vg.setLeafSize(g_loc.map_voxel_leaf, g_loc.map_voxel_leaf, g_loc.map_voxel_leaf);
     vg.setInputCloud(g_global_map_raw);
     vg.filter(*g_global_map_ds);
+    
+    ROS_INFO("[localization] Downsampled to %zu points (voxel=%.2f)", 
+             g_global_map_ds->size(), g_loc.map_voxel_leaf);
 
     // 可选统计滤波
     if (g_loc.map_remove_outliers) {
@@ -736,19 +809,35 @@ bool LoadGlobalMapAndBuildIndex()
         sor.setStddevMulThresh(g_loc.map_outlier_stddev_mul);
         pcl::PointCloud<PointType>::Ptr filtered(new pcl::PointCloud<PointType>());
         sor.filter(*filtered);
+        
+        size_t before = g_global_map_ds->size();
         *g_global_map_ds = *filtered;
+        ROS_INFO("[localization] Statistical outlier removal: %zu -> %zu points", 
+                 before, g_global_map_ds->size());
     }
 
+    // 检查点云
     if (g_global_map_ds->empty()) {
         ROS_ERROR("[localization] Global map is empty after preprocessing.");
         return false;
     }
 
-    // 构建 KD-Tree
-    g_kdtree_global->setInputCloud(g_global_map_ds);
+    // 构建 ikd-Tree（注意：ikd-Tree 使用 Build 方法，不是 setInputCloud）
+    try {
+        ikdtree_global.Build(g_global_map_ds->points);  // ✅ 使用 Build 方法
+        g_global_ikdtree_ready = true;
+        ROS_INFO("[localization] ikdtree_global built successfully. Size: %d", 
+                 ikdtree_global.size());
+    } catch (const std::exception& e) {
+        ROS_ERROR("[localization] Failed to build ikdtree: %s", e.what());
+        return false;
+    }
 
-    ROS_INFO("[localization] Global map loaded: raw=%zu, ds=%zu, leaf=%.2f",
-             g_global_map_raw->size(), g_global_map_ds->size(), g_loc.map_voxel_leaf);
+    ROS_INFO("[localization] Global map loaded successfully:");
+    ROS_INFO("  - Raw points: %zu", g_global_map_raw->size());
+    ROS_INFO("  - Downsampled: %zu (leaf=%.2fm)", g_global_map_ds->size(), g_loc.map_voxel_leaf);
+    ROS_INFO("  - ikdtree size: %d", ikdtree_global.size());
+    
     return true;
 }
 
@@ -756,56 +845,32 @@ PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
 {
-    if(scan_pub_en)
-    {
-        PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-        int size = laserCloudFullRes->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld( \
-                        new PointCloudXYZI(size, 1));
+    if(!scan_pub_en) return;
 
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                                &laserCloudWorld->points[i]);
-        }
+    PointCloudXYZI::Ptr src(dense_pub_en ? feats_undistort : feats_down_body);
+    int size = src->points.size();
 
-        sensor_msgs::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.frame_id = "map";
-        pubLaserCloudFull.publish(laserCloudmsg);
-        publish_count -= PUBFRAME_PERIOD;
+    // 步骤1：LiDAR/body -> local world
+    PointCloudXYZI::Ptr cloud_local(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++) {
+        RGBpointBodyToWorld(&src->points[i], &cloud_local->points[i]);
     }
 
-    /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. noted that pcd save will influence the real-time performences **/
-    if (pcd_save_en)
-    {
-        int size = feats_undistort->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld( \
-                        new PointCloudXYZI(size, 1));
-
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&feats_undistort->points[i], \
-                                &laserCloudWorld->points[i]);
-        }
-        *pcl_wait_save += *laserCloudWorld;
-
-        static int scan_wait_num = 0;
-        scan_wait_num ++;
-        if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
-        {
-            pcd_index ++;
-            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
-            pcl::PCDWriter pcd_writer;
-            cout << "current scan saved to /PCD/" << all_points_dir << endl;
-            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-            pcl_wait_save->clear();
-            scan_wait_num = 0;
-        }
+    // 步骤2：local -> map（如有）
+    PointCloudXYZI::Ptr cloud_map = cloud_local;
+    bool has_map = g_has_T_map_local.load(std::memory_order_acquire);
+    if (has_map) {
+        std::lock_guard<std::mutex> lk(g_mtx_TmapLocal);
+        cloud_map.reset(new PointCloudXYZI());
+        pcl::transformPointCloud(*cloud_local, *cloud_map, g_T_map_local.matrix().cast<float>());
     }
+
+    sensor_msgs::PointCloud2 msg;
+    pcl::toROSMsg(*cloud_map, msg);
+    msg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    msg.header.frame_id = "map";
+    pubLaserCloudFull.publish(msg);
+    publish_count -= PUBFRAME_PERIOD;
 }
 
 void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
@@ -867,11 +932,38 @@ void set_posestamp(T & out)
 
 void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 {
+    // 1) 组装 local 下的 IMU位姿
+    Eigen::Isometry3d T_local_I = Eigen::Isometry3d::Identity();
+    T_local_I.linear()      = state_point.rot.toRotationMatrix();
+    T_local_I.translation() = state_point.pos;
+
+    // 2) 如有 T_map_local，则左乘到 map
+    Eigen::Isometry3d T_map_I = T_local_I;
+    bool has_map = g_has_T_map_local.load(std::memory_order_acquire);
+    if (has_map) {
+        std::lock_guard<std::mutex> lk(g_mtx_TmapLocal);
+        T_map_I = g_T_map_local * T_local_I;
+    }
+
+    // 3) 发布 odom（map 框架）
     odomAftMapped.header.frame_id = "map";
-    odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
+    odomAftMapped.child_frame_id  = "body";
+    odomAftMapped.header.stamp    = ros::Time().fromSec(lidar_end_time);
+
+    Eigen::Quaterniond q(T_map_I.rotation());
+    Eigen::Vector3d    t = T_map_I.translation();
+
+    odomAftMapped.pose.pose.position.x = t.x();
+    odomAftMapped.pose.pose.position.y = t.y();
+    odomAftMapped.pose.pose.position.z = t.z();
+    odomAftMapped.pose.pose.orientation.x = q.x();
+    odomAftMapped.pose.pose.orientation.y = q.y();
+    odomAftMapped.pose.pose.orientation.z = q.z();
+    odomAftMapped.pose.pose.orientation.w = q.w();
+
     pubOdomAftMapped.publish(odomAftMapped);
+
+    // 协方差保持原逻辑
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -884,31 +976,51 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
+    // 4) TF: map -> body
     static tf::TransformBroadcaster br;
-    tf::Transform                   transform;
-    tf::Quaternion                  q;
-    transform.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x, \
-                                    odomAftMapped.pose.pose.position.y, \
-                                    odomAftMapped.pose.pose.position.z));
-    q.setW(odomAftMapped.pose.pose.orientation.w);
-    q.setX(odomAftMapped.pose.pose.orientation.x);
-    q.setY(odomAftMapped.pose.pose.orientation.y);
-    q.setZ(odomAftMapped.pose.pose.orientation.z);
-    transform.setRotation( q );
-    br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "map", "body" ) );
+    tf::Transform T_tf;
+    tf::Quaternion q_tf(q.x(), q.y(), q.z(), q.w());
+    T_tf.setOrigin(tf::Vector3(t.x(), t.y(), t.z()));
+    T_tf.setRotation(q_tf);
+    br.sendTransform(tf::StampedTransform(T_tf, odomAftMapped.header.stamp, "map", "body"));
 }
 
-void publish_path(const ros::Publisher pubPath)
+void publish_path(const ros::Publisher& pubPath)
 {
-    set_posestamp(msg_body_pose);
+    // 1) 组装 local 下的 IMU位姿 T_local_I
+    Eigen::Isometry3d T_local_I = Eigen::Isometry3d::Identity();
+    T_local_I.linear()      = state_point.rot.toRotationMatrix();
+    T_local_I.translation() = state_point.pos;
+
+    // 2) 如有 T_map_local，则左乘得到 map 下位姿 T_map_I
+    Eigen::Isometry3d T_map_I = T_local_I;
+    const bool has_map = g_has_T_map_local.load(std::memory_order_acquire);
+    if (has_map) {
+        std::lock_guard<std::mutex> lk(g_mtx_TmapLocal);
+        T_map_I = g_T_map_local * T_local_I; // local -> map
+    }
+
+    // 3) 写入 PoseStamped
+    const Eigen::Vector3d t = T_map_I.translation();
+    const Eigen::Quaterniond q(T_map_I.rotation());
+
+    msg_body_pose.pose.position.x = t.x();
+    msg_body_pose.pose.position.y = t.y();
+    msg_body_pose.pose.position.z = t.z();
+    msg_body_pose.pose.orientation.x = q.x();
+    msg_body_pose.pose.orientation.y = q.y();
+    msg_body_pose.pose.orientation.z = q.z();
+    msg_body_pose.pose.orientation.w = q.w();
+
     msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
     msg_body_pose.header.frame_id = "map";
 
-    /*** if path is too large, the rvis will crash ***/
+    // 4) 累计并发布 Path（避免太密）
     static int jjj = 0;
     jjj++;
-    if (jjj % 10 == 0) 
-    {
+    if (jjj % 10 == 0) {
+        path.header.frame_id = "map";
+        path.header.stamp = msg_body_pose.header.stamp;
         path.poses.push_back(msg_body_pose);
         pubPath.publish(path);
     }
@@ -922,6 +1034,99 @@ void publish_global_map(const ros::Publisher& pub)
     msg.header.frame_id = "map";
     msg.header.stamp = ros::Time::now();
     pub.publish(msg);
+}
+
+
+// ===== 检查是否应该激活后端 =====
+// ===== 检查是否应该激活后端 =====
+bool shouldActivateBackend()
+{
+    if (g_backend_state.is_active) return true;
+    if (!g_backend_cfg.enable) return false;
+    
+    // 帧数检查
+    if (g_backend_state.frame_count < g_backend_cfg.min_frames) {
+        return false;
+    }
+    
+    // 点数检查
+    int local_points = ikdtree.size();
+    if (local_points < g_backend_cfg.min_local_points) {
+        ROS_INFO_THROTTLE(5.0, "[Backend] Waiting for local map: %d / %d points", 
+                         local_points, g_backend_cfg.min_local_points);
+        return false;
+    }
+    
+    // 全局地图检查
+    if (!g_global_ikdtree_ready) {
+        ROS_WARN_THROTTLE(5.0, "[Backend] Global map not ready!");
+        return false;
+    }
+    
+    // ===== 新增：initpose 检查 =====
+    if (!has_ndt_init_pose) {
+        ROS_WARN_THROTTLE(5.0, "[Backend] Waiting for /initpose to activate backend...");
+        return false;
+    }
+    
+    g_backend_state.is_active = true;
+    ROS_WARN("[Backend] ==== BACKEND ACTIVATED ==== Local points: %d, Frames: %d",
+             local_points, g_backend_state.frame_count);
+    
+    return true;
+}
+
+// ===== 从 local ikdtree 提取 submap =====
+// ===== 从 local ikdtree 提取 submap =====
+bool extractSubmapFromLocal(
+    KD_TREE<PointType>& local_tree,
+    const V3D& center_pos,
+    float radius,
+    PointCloudXYZI::Ptr& submap_out)
+{
+    if (local_tree.Root_Node == nullptr) {
+        ROS_WARN_THROTTLE(1.0, "[Submap] Local tree is empty!");
+        return false;
+    }
+    
+    // 构造搜索框
+    BoxPointType search_box;
+    for (int i = 0; i < 3; i++) {
+        search_box.vertex_min[i] = center_pos(i) - radius;
+        search_box.vertex_max[i] = center_pos(i) + radius;
+    }
+    
+    // 从 ikdtree 搜索
+    PointVector points_in_box;
+    local_tree.Box_Search(search_box, points_in_box);
+    
+    if (points_in_box.size() < 100) {
+        ROS_WARN_THROTTLE(1.0, "[Submap] Too few points in box: %zu", points_in_box.size());
+        return false;
+    }
+    
+    // 转为点云
+    submap_out->clear();
+    submap_out->points = points_in_box;
+    submap_out->width = points_in_box.size();
+    submap_out->height = 1;
+    submap_out->is_dense = true;
+    
+    // 降采样（可选，基于配置）
+    if (g_backend_cfg.submap_voxel_size > 0.01f && submap_out->size() > 10000) {
+        pcl::VoxelGrid<PointType> vg;
+        vg.setLeafSize(g_backend_cfg.submap_voxel_size, 
+                       g_backend_cfg.submap_voxel_size, 
+                       g_backend_cfg.submap_voxel_size);
+        vg.setInputCloud(submap_out);
+        PointCloudXYZI::Ptr filtered(new PointCloudXYZI());
+        vg.filter(*filtered);
+        submap_out = filtered;
+    }
+    
+    ROS_INFO_THROTTLE(2.0, "[Submap] Extracted %zu points (radius=%.1fm, center=[%.1f, %.1f, %.1f])", 
+                     submap_out->size(), radius, center_pos.x(), center_pos.y(), center_pos.z());
+    return true;
 }
 
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
@@ -1006,29 +1211,31 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 std::vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
                 auto &points_near_local = Nearest_Points[i];
 
-                ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near_local, pointSearchSqDis);
+                if (ekfom_data.converge) {
+                    ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near_local, pointSearchSqDis);
 
-                const bool ok_local =
-                    (points_near_local.size() >= NUM_MATCH_POINTS) &&
-                    (pointSearchSqDis[NUM_MATCH_POINTS - 1] <= dist_th_local);
+                    const bool ok_local =
+                        (points_near_local.size() >= NUM_MATCH_POINTS) &&
+                        (pointSearchSqDis[NUM_MATCH_POINTS - 1] <= dist_th_local);
 
-                if (ok_local)
-                {
-                    VF(4) pabcd;
-                    if (esti_plane(pabcd, points_near_local, plane_eps))
+                    if (ok_local)
                     {
-                        const float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-                        const float body_norm = std::max<float>(1e-3f, (float)p_body.norm());
-                        const float s_val = 1.0f - 0.9f * std::fabs(pd2) / std::sqrt(body_norm);
-
-                        if (s_val > s_gate)
+                        VF(4) pabcd;
+                        if (esti_plane(pabcd, points_near_local, plane_eps))
                         {
-                            point_selected_surf_local[i] = true;
-                            normvec->points[i].x = pabcd(0);
-                            normvec->points[i].y = pabcd(1);
-                            normvec->points[i].z = pabcd(2);
-                            normvec->points[i].intensity = pd2;
-                            res_last_local[i] = std::fabs(pd2);
+                            const float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
+                            const float body_norm = std::max<float>(1e-3f, (float)p_body.norm());
+                            const float s_val = 1.0f - 0.9f * std::fabs(pd2) / std::sqrt(body_norm);
+
+                            if (s_val > s_gate)
+                            {
+                                point_selected_surf_local[i] = true;
+                                normvec->points[i].x = pabcd(0);
+                                normvec->points[i].y = pabcd(1);
+                                normvec->points[i].z = pabcd(2);
+                                normvec->points[i].intensity = pd2;
+                                res_last_local[i] = std::fabs(pd2);
+                            }
                         }
                     }
                 }
@@ -1282,6 +1489,592 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (s_boost_frames > 0) s_boost_frames--;
 }
 
+// ===== 后端观测模型：Submap 对 Global Map =====
+void h_share_model_submap(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
+{
+    if (!g_global_ikdtree_ready || !g_current_submap || g_current_submap->empty()) {
+        ekfom_data.valid = false;
+        ROS_WARN_THROTTLE(1.0, "[Backend] Global map or backend submap not ready!");
+        return;
+    }
+    
+    double match_start = omp_get_wtime();
+    
+    // 清空容器
+    static PointCloudXYZI::Ptr submap_body(new PointCloudXYZI());
+    static PointCloudXYZI::Ptr submap_world(new PointCloudXYZI());
+    static PointCloudXYZI::Ptr norm_vec_cloud(new PointCloudXYZI());
+    static std::vector<bool> point_selected;
+    static std::vector<float> residuals;
+    
+    submap_body->clear();
+    submap_world->clear();
+    norm_vec_cloud->clear();
+    
+    int submap_size = g_current_submap->size();
+    submap_body->resize(submap_size);
+    submap_world->resize(submap_size);
+    norm_vec_cloud->resize(submap_size);
+    if ((int)point_selected.size() < submap_size) point_selected.resize(submap_size, false);
+    if ((int)residuals.size() < submap_size) residuals.resize(submap_size, 0.0f);
+    std::fill(point_selected.begin(), point_selected.begin() + submap_size, false);
+
+    const Eigen::Matrix3d R_local_imu_anchor = g_submap_anchor_frontend_state.rot.toRotationMatrix();
+    const Eigen::Vector3d t_local_imu_anchor = g_submap_anchor_frontend_state.pos;
+    
+    // 参数
+    const float dist_threshold = std::max(12.0f, 8.0f * g_backend_cfg.max_point2plane_dist);  // 搜索距离
+    const float plane_eps = 0.1f;
+    const float s_gate = 0.60f;  // 放宽门限，避免中等姿态偏差时全部被拒
+    const float max_residual = std::max(1.5f, 2.5f * g_backend_cfg.max_point2plane_dist);
+    
+    // 1. 坐标变换 + 最近邻搜索
+    #ifdef MP_EN
+        omp_set_num_threads(MP_PROC_NUM);
+        #pragma omp parallel for
+    #endif
+    for (int i = 0; i < submap_size; i++)
+    {
+        // submap 点来自 local 世界坐标，先用锚点位姿反推到“锚点IMU坐标”
+        // p_local = R_local_imu_anchor * p_imu_anchor + t_local_imu_anchor
+        PointType &pt_local = g_current_submap->points[i];
+        V3D p_local(pt_local.x, pt_local.y, pt_local.z);
+        V3D p_imu_anchor = R_local_imu_anchor.transpose() * (p_local - t_local_imu_anchor);
+        
+        PointType pt_body;
+        pt_body.x = p_imu_anchor(0);
+        pt_body.y = p_imu_anchor(1);
+        pt_body.z = p_imu_anchor(2);
+        pt_body.intensity = pt_local.intensity;
+        submap_body->points[i] = pt_body;
+        
+        // 后端状态 s 表示 map 下 IMU 位姿（锚点时刻），直接 map <- imu_anchor
+        V3D p_global_backend = s.rot * p_imu_anchor + s.pos;
+        PointType pt_world_backend;
+        pt_world_backend.x = p_global_backend(0);
+        pt_world_backend.y = p_global_backend(1);
+        pt_world_backend.z = p_global_backend(2);
+        pt_world_backend.intensity = pt_local.intensity;
+        submap_world->points[i] = pt_world_backend;
+        
+        // 在全局地图中搜索
+        std::vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
+        KD_TREE<PointType>::PointVector points_near;
+        
+        ikdtree_global.Nearest_Search(pt_world_backend, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+        
+        bool is_valid = (points_near.size() >= NUM_MATCH_POINTS) && 
+                        (pointSearchSqDis[NUM_MATCH_POINTS - 1] <= dist_threshold);
+        
+        if (!is_valid) continue;
+        
+        // 估计平面
+        VF(4) pabcd;
+        if (!esti_plane(pabcd, points_near, plane_eps)) continue;
+        
+        // 计算残差
+        float pd2 = pabcd(0) * pt_world_backend.x + 
+                    pabcd(1) * pt_world_backend.y + 
+                    pabcd(2) * pt_world_backend.z + 
+                    pabcd(3);
+        
+        float s_val = 1.0f - 0.9f * std::fabs(pd2) / std::sqrt(std::max(0.01f, (float)p_imu_anchor.norm()));
+        
+        if (s_val > s_gate && std::fabs(pd2) <= max_residual)
+        {
+            point_selected[i] = true;
+            norm_vec_cloud->points[i].x = pabcd(0);
+            norm_vec_cloud->points[i].y = pabcd(1);
+            norm_vec_cloud->points[i].z = pabcd(2);
+            norm_vec_cloud->points[i].intensity = pd2;
+            residuals[i] = std::fabs(pd2);
+        }
+    }
+    
+    // 2. 收集有效观测（限制数量）
+    std::vector<int> valid_indices;
+    valid_indices.reserve(submap_size);
+    for (int i = 0; i < submap_size; i++) {
+        if (point_selected[i]) {
+            valid_indices.push_back(i);
+        }
+    }
+    
+    // 降采样/限制数量
+    int max_points = g_backend_cfg.max_global_points;
+    if (valid_indices.size() > max_points) {
+        // 简单均匀采样
+        std::vector<int> sampled;
+        sampled.reserve(max_points);
+        float step = (float)valid_indices.size() / max_points;
+        for (int k = 0; k < max_points; k++) {
+            int idx = (int)(k * step);
+            sampled.push_back(valid_indices[idx]);
+        }
+        valid_indices = sampled;
+    }
+    
+    int effct_feat_num = valid_indices.size();
+    g_backend_effective_points = effct_feat_num;
+    
+    if (effct_feat_num < 10) {
+        ekfom_data.valid = false;
+        g_backend_residual_mean = 0.0;
+        ROS_WARN_THROTTLE(1.0, "[Backend] Too few effective points: %d / %d", effct_feat_num, submap_size);
+        return;
+    }
+    
+    ROS_INFO_THROTTLE(2.0, "[Backend] Effective points: %d / %d", effct_feat_num, submap_size);
+    
+    // 3. 构造观测
+    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12);
+    ekfom_data.h.resize(effct_feat_num);
+    
+    const double w_global = g_backend_cfg.global_residual_weight;
+    double residual_sum = 0.0;
+    
+    for (int r = 0; r < effct_feat_num; r++)
+    {
+        int i = valid_indices[r];
+        
+        const PointType &laser_p = submap_body->points[i];
+        const PointType &norm_p = norm_vec_cloud->points[i];
+        
+        V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
+        M3D point_be_crossmat;
+        point_be_crossmat << SKEW_SYM_MATRX(point_this_be);
+        
+        V3D point_this = point_this_be;
+        M3D point_crossmat;
+        point_crossmat << SKEW_SYM_MATRX(point_this);
+        
+        V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
+        norm_vec *= w_global;  // 加权
+        
+        V3D C(s.rot.conjugate() * norm_vec);
+        V3D A(point_crossmat * C);
+        
+        // 后端 submap/global 配准仅优化 map 下位姿，不估计外参
+        ekfom_data.h_x.block<1, 12>(r, 0) << norm_vec(0), norm_vec(1), norm_vec(2), 
+            VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+        
+        ekfom_data.h(r) = -norm_p.intensity * w_global;
+        residual_sum += std::fabs(norm_p.intensity);
+    }
+    g_backend_residual_mean = residual_sum / std::max(1, effct_feat_num);
+    
+    double match_time_backend = omp_get_wtime() - match_start;
+    ROS_INFO_THROTTLE(2.0, "[Backend] Match time: %.3f ms", match_time_backend * 1000);
+}
+
+// ===== 将点云从 local 坐标系变换到 global 坐标系 =====
+void transformPointCloudToGlobal(
+    const PointCloudXYZI::Ptr& cloud_local,
+    PointCloudXYZI::Ptr& cloud_global,
+    const Eigen::Matrix4d& T_map_local)
+{
+    cloud_global->clear();
+    cloud_global->reserve(cloud_local->size());
+    
+    Eigen::Matrix3d R = T_map_local.topLeftCorner<3,3>();
+    Eigen::Vector3d t = T_map_local.block<3,1>(0,3);
+    
+    for (const auto& pt : cloud_local->points) {
+        Eigen::Vector3d p_local(pt.x, pt.y, pt.z);
+        Eigen::Vector3d p_global = R * p_local + t;
+        
+        PointType pt_global;
+        pt_global.x = p_global.x();
+        pt_global.y = p_global.y();
+        pt_global.z = p_global.z();
+        pt_global.intensity = pt.intensity;
+        
+        cloud_global->push_back(pt_global);
+    }
+}
+
+// ===== 根据后端状态计算 T_map_local =====
+Eigen::Matrix4d computeTransformMapLocal(
+    const state_ikfom& global_state,
+    const state_ikfom& local_state)
+{
+    // global_state: 后端优化的全局位姿 (IMU in map frame)
+    // local_state: 前端位姿 (IMU in local frame)
+    
+    // T_map_imu_global = [R_map_imu, t_map_imu]
+    Eigen::Matrix3d R_map_imu = global_state.rot.toRotationMatrix();
+    Eigen::Vector3d t_map_imu = global_state.pos;
+    
+    // T_local_imu_local = [R_local_imu, t_local_imu]
+    Eigen::Matrix3d R_local_imu = local_state.rot.toRotationMatrix();
+    Eigen::Vector3d t_local_imu = local_state.pos;
+    
+    // T_map_local = T_map_imu_global * T_imu_local^{-1}
+    //             = T_map_imu_global * (T_local_imu)^{-1}
+    Eigen::Matrix4d T_local_imu = Eigen::Matrix4d::Identity();
+    T_local_imu.topLeftCorner<3,3>() = R_local_imu;
+    T_local_imu.block<3,1>(0,3) = t_local_imu;
+    
+    Eigen::Matrix4d T_map_imu = Eigen::Matrix4d::Identity();
+    T_map_imu.topLeftCorner<3,3>() = R_map_imu;
+    T_map_imu.block<3,1>(0,3) = t_map_imu;
+    
+    Eigen::Matrix4d T_map_local = T_map_imu * T_local_imu.inverse();
+    
+    return T_map_local;
+}
+
+// ===== 后端线程主函数 =====
+// ===== 后端线程主函数 =====
+// ===== 后端线程主函数 =====
+// ===== 后端线程主函数 =====
+void backendThreadFunc()
+{
+    ROS_INFO("[Backend] Backend thread started.");
+    g_backend_state.is_running = true;
+    
+    // 初始化后端 EKF
+    double epsi[23];
+    std::fill(epsi, epsi + 23, 0.001);
+    kf_backend.init_dyn_share(get_f, df_dx, df_dw, h_share_model_submap, NUM_MAX_ITERATIONS, epsi);
+    
+    bool backend_initialized = false;
+    bool has_prev_frontend = false;
+    state_ikfom prev_frontend_state;
+    
+    while (!backend_should_stop)
+    {
+        BackendData data;
+        
+        // 等待数据
+        {
+            std::unique_lock<std::mutex> lock(mtx_backend);
+            cv_backend.wait(lock, [&]{ 
+                return !backend_queue.empty() || backend_should_stop; 
+            });
+            
+            if (backend_should_stop) break;
+            if (backend_queue.empty()) continue;
+            
+            data = backend_queue.front();
+            backend_queue.pop_front();
+        }
+        
+        // ===== 首次初始化：NDT 配准 =====
+        if (!backend_initialized)
+        {
+            ROS_INFO("[Backend] First submap received. Performing NDT initialization...");
+            
+            // 检查全局地图
+            if (!g_global_map_ready || !g_global_map_ds || g_global_map_ds->empty())
+            {
+                ROS_ERROR("[Backend] Global map not ready for NDT!");
+                continue;
+            }
+            
+            // 检查 submap
+            if (!data.submap || data.submap->size() < 100)
+            {
+                ROS_WARN("[Backend] Submap too small (%zu points), waiting...", 
+                         data.submap ? data.submap->size() : 0);
+                continue;
+            }
+            
+            // 检查初始位姿
+            if (!has_ndt_init_pose)
+            {
+                ROS_WARN_THROTTLE(2.0, "[Backend] Waiting for /initpose...");
+                // 将数据放回队列
+                {
+                    std::lock_guard<std::mutex> lock(mtx_backend);
+                    backend_queue.push_front(data);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            
+            // === NDT 配准 ===
+            try {
+                // 准备点云
+                pcl::PointCloud<PointType>::Ptr src(new pcl::PointCloud<PointType>(*data.submap));
+                pcl::PointCloud<PointType>::Ptr tgt(new pcl::PointCloud<PointType>(*g_global_map_ds));
+                
+                // 去除 NaN
+                std::vector<int> idx;
+                pcl::removeNaNFromPointCloud(*src, *src, idx);
+                pcl::removeNaNFromPointCloud(*tgt, *tgt, idx);
+                src->is_dense = true;
+                tgt->is_dense = true;
+                
+                // 点数检查
+                if (src->size() < 100 || tgt->size() < 100)
+                {
+                    ROS_ERROR("[Backend NDT] Insufficient points: src=%zu, tgt=%zu", 
+                              src->size(), tgt->size());
+                    continue;
+                }
+                
+                // 降采样 src（NDT 输入不要太密集）
+                if (src->size() > 20000) {
+                    pcl::VoxelGrid<PointType> vg;
+                    vg.setLeafSize(0.5f, 0.5f, 0.5f);
+                    vg.setInputCloud(src);
+                    pcl::PointCloud<PointType>::Ptr src_ds(new pcl::PointCloud<PointType>());
+                    vg.filter(*src_ds);
+                    src = src_ds;
+                    ROS_INFO("[Backend NDT] Source downsampled: %zu -> %zu", 
+                             data.submap->size(), src->size());
+                }
+                
+                ROS_INFO("[Backend NDT] Source: %zu points, Target: %zu points", 
+                         src->size(), tgt->size());
+                
+                // NDT 配置
+                pcl::NormalDistributionsTransform<PointType, PointType> ndt;
+                ndt.setResolution(2.0);           // NDT 体素大小
+                ndt.setStepSize(0.2);             // 优化步长
+                ndt.setTransformationEpsilon(1e-3);
+                ndt.setMaximumIterations(50);
+                ndt.setInputTarget(tgt);
+                ndt.setInputSource(src);
+                
+                // 初始位姿（来自 /initpose）
+                Eigen::Matrix4f T_init = Eigen::Matrix4f::Identity();
+                T_init.topLeftCorner<3,3>() = ndt_init_q.toRotationMatrix().cast<float>();
+                T_init.block<3,1>(0,3) = ndt_init_t.cast<float>();
+                
+                ROS_INFO("[Backend NDT] Initial pose: t=[%.2f, %.2f, %.2f]",
+                         ndt_init_t.x(), ndt_init_t.y(), ndt_init_t.z());
+                
+                // 执行配准
+                pcl::PointCloud<PointType> aligned;
+                double ndt_start = omp_get_wtime();
+                ndt.align(aligned, T_init);
+                double ndt_time = omp_get_wtime() - ndt_start;
+                
+                // 检查收敛
+                if (ndt.hasConverged()) {
+                    Eigen::Matrix4f T_map_local_f = ndt.getFinalTransformation();
+                    if (T_map_local_f.allFinite()) {
+                        Eigen::Isometry3d T_map_local_iso = Eigen::Isometry3d::Identity();
+                        T_map_local_iso.linear()  = T_map_local_f.topLeftCorner<3,3>().cast<double>();
+                        T_map_local_iso.translation() = T_map_local_f.block<3,1>(0,3).cast<double>();
+
+                        // 1) 保存/发布 local->map 变换（唯一真相）
+                        {
+                            std::lock_guard<std::mutex> lk(g_mtx_TmapLocal);
+                            g_T_map_local = T_map_local_iso;
+                            g_has_T_map_local.store(true, std::memory_order_release);
+                        }
+
+                        // 2) 初始化后端状态到 map（IMU in map）
+                        //    T_map_imu = T_map_local * T_local_imu
+                        Eigen::Matrix3d R_local_imu = data.frontend_state.rot.toRotationMatrix();
+                        Eigen::Vector3d t_local_imu = data.frontend_state.pos;
+
+                        Eigen::Matrix3d R_map_imu = g_T_map_local.rotation() * R_local_imu;
+                        Eigen::Vector3d t_map_imu = g_T_map_local.rotation() * t_local_imu + g_T_map_local.translation();
+
+                        state_ikfom init_state = data.frontend_state;
+                        init_state.rot = Eigen::Quaterniond(R_map_imu);
+                        init_state.pos = t_map_imu;
+                        kf_backend.change_x(init_state);
+
+                        g_backend_state.global_state = init_state;
+                        g_backend_state.has_global_state = true;
+                        prev_frontend_state = data.frontend_state;
+                        has_prev_frontend = true;
+
+                        // 3) 可视化：把 submap 变到 map
+                        {
+                            std::lock_guard<std::mutex> lk(mtx_backend_vis);
+                            g_current_submap = data.submap;
+                            transformPointCloudToGlobal(g_current_submap, g_current_submap_global, g_T_map_local.matrix());
+                        }
+
+                        ROS_INFO("[Backend NDT] init done. fitness=%.6f", ndt.getFitnessScore());
+                        backend_initialized = true;
+                        continue;
+                    }
+                }
+                
+                // 获取结果
+                Eigen::Matrix4f T_map_submap_f = ndt.getFinalTransformation();
+                Eigen::Matrix4d T_map_submap = T_map_submap_f.cast<double>();
+                
+                // 检查有效性
+                if (!T_map_submap.allFinite())
+                {
+                    ROS_ERROR("[Backend NDT] Result contains NaN/Inf!");
+                    continue;
+                }
+                
+                double fitness = ndt.getFitnessScore();
+                if (fitness > 1.0) {  // 阈值可调
+                    ROS_WARN("[Backend NDT] Fitness score high (%.3f), result may be unreliable!", fitness);
+                    // 可以选择拒绝或继续
+                }
+                
+                // === 计算全局初始状态 ===
+                // T_map_submap 是：submap(local) -> map(global)
+                // submap 中心在 local 原点附近
+                // 所以 T_map_local ≈ T_map_submap
+                
+                Eigen::Matrix3d R_map_local = T_map_submap.topLeftCorner<3,3>();
+                Eigen::Vector3d t_map_local = T_map_submap.block<3,1>(0,3);
+                
+                // 前端状态：IMU in local frame
+                Eigen::Matrix3d R_local_imu = data.frontend_state.rot.toRotationMatrix();
+                Eigen::Vector3d t_local_imu = data.frontend_state.pos;
+                
+                // 全局状态：IMU in map frame
+                // T_map_imu = T_map_local * T_local_imu
+                Eigen::Matrix3d R_map_imu = R_map_local * R_local_imu;
+                Eigen::Vector3d t_map_imu = R_map_local * t_local_imu + t_map_local;
+                
+                // 初始化后端 EKF 状态
+                state_ikfom init_state = data.frontend_state;
+                init_state.rot = Eigen::Quaterniond(R_map_imu);
+                init_state.pos = t_map_imu;
+                
+                kf_backend.change_x(init_state);
+                g_backend_state.global_state = init_state;
+                g_backend_state.has_global_state = true;
+                backend_initialized = true;
+                prev_frontend_state = data.frontend_state;
+                has_prev_frontend = true;
+                
+                // 保存变换矩阵（local -> map）
+                {
+                    std::lock_guard<std::mutex> lock(g_mtx_TmapLocal);
+                    g_T_map_local.linear() = R_map_local;
+                    g_T_map_local.translation() = t_map_local;
+                    g_has_T_map_local.store(true, std::memory_order_release);
+                }
+                
+                // 变换 submap 到全局坐标系
+                {
+                    std::lock_guard<std::mutex> lock(mtx_backend_vis);
+                    transformPointCloudToGlobal(data.submap, g_current_submap_global, T_map_submap);
+                    g_current_submap = data.submap;  // 保存 local 版本
+                }
+                
+                ROS_WARN("[Backend NDT] ==== INITIALIZATION SUCCESS ====");
+                ROS_INFO("[Backend NDT] Time: %.3f ms, Fitness: %.6f, Iters: %d",
+                         ndt_time * 1000, fitness, ndt.getFinalNumIteration());
+                
+                Eigen::Vector3d rpy = R_map_imu.eulerAngles(2,1,0) * 180.0 / M_PI;  // yaw, pitch, roll
+                ROS_INFO("[Backend NDT] Global pose: t=[%.2f, %.2f, %.2f], RPY=[%.1f, %.1f, %.1f] deg",
+                         t_map_imu.x(), t_map_imu.y(), t_map_imu.z(), rpy.x(), rpy.y(), rpy.z());
+                ROS_INFO("[Backend NDT] Submap: %zu pts (local) -> %zu pts (global)",
+                         data.submap->size(), g_current_submap_global->size());
+                
+                continue;
+                
+            } catch (const std::exception& e) {
+                ROS_ERROR("[Backend NDT] Exception: %s", e.what());
+                continue;
+            }
+        }
+        
+        // ===== 后续优化（保持原样，使用 h_share_model_submap） =====
+        if (!backend_initialized)
+        {
+            ROS_WARN("[Backend] Not initialized, skipping.");
+            continue;
+        }
+        
+        double t_start = omp_get_wtime();
+        
+        // 预测项：仅使用“后端上一次全局状态 + 前端相对运动增量”。
+        // 不再每次强行绑定前端绝对位姿，保证后端可被 global map 持续拉回与重定位。
+        state_ikfom pred_state = g_backend_state.global_state;
+        if (has_prev_frontend) {
+            Eigen::Matrix4d T_local_prev = Eigen::Matrix4d::Identity();
+            T_local_prev.topLeftCorner<3,3>() = prev_frontend_state.rot.toRotationMatrix();
+            T_local_prev.block<3,1>(0,3) = prev_frontend_state.pos;
+
+            Eigen::Matrix4d T_local_cur = Eigen::Matrix4d::Identity();
+            T_local_cur.topLeftCorner<3,3>() = data.frontend_state.rot.toRotationMatrix();
+            T_local_cur.block<3,1>(0,3) = data.frontend_state.pos;
+
+            // 前端相对运动：prev IMU -> cur IMU（在 prev IMU 坐标中表达）
+            const Eigen::Matrix4d T_delta = T_local_prev.inverse() * T_local_cur;
+
+            Eigen::Matrix4d T_map_prev = Eigen::Matrix4d::Identity();
+            T_map_prev.topLeftCorner<3,3>() = g_backend_state.global_state.rot.toRotationMatrix();
+            T_map_prev.block<3,1>(0,3) = g_backend_state.global_state.pos;
+
+            const Eigen::Matrix4d T_map_pred = T_map_prev * T_delta;
+            pred_state.pos = T_map_pred.block<3,1>(0,3);
+            pred_state.rot = Eigen::Quaterniond(T_map_pred.topLeftCorner<3,3>());
+        }
+
+        // 设置当前 submap（观测模型会用）
+        kf_backend.change_x(pred_state);
+        g_current_submap = data.submap;
+        g_submap_anchor_frontend_state = data.frontend_state;
+
+        g_backend_state.total_updates++;
+        
+        double solve_H_time = 0;
+        try {
+            kf_backend.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            
+            g_backend_state.global_state = kf_backend.get_x();
+            g_backend_state.successful_updates++;
+
+            // 诊断：本次后端 IEKF 对全局状态的修正幅度（若长期接近 0，则约束几乎未生效）
+            double corr_trans = (g_backend_state.global_state.pos - pred_state.pos).norm();
+            Eigen::Quaterniond dq = pred_state.rot.conjugate() * g_backend_state.global_state.rot;
+            dq.normalize();
+            double corr_rot_deg = Eigen::AngleAxisd(dq).angle() * 180.0 / M_PI;
+            
+            // 计算并写回 T_map_local
+            Eigen::Matrix4d T_map_local_new = computeTransformMapLocal(
+                g_backend_state.global_state,  // IMU in map
+                data.frontend_state            // IMU in local
+            );
+            {
+                std::lock_guard<std::mutex> lk(g_mtx_TmapLocal);
+                g_T_map_local.linear()      = T_map_local_new.topLeftCorner<3,3>();
+                g_T_map_local.translation() = T_map_local_new.block<3,1>(0,3);
+                g_has_T_map_local.store(true, std::memory_order_release);
+            }
+
+            // 可视化 submap->map
+            {
+                std::lock_guard<std::mutex> lk(mtx_backend_vis);
+                g_current_submap = data.submap;
+                transformPointCloudToGlobal(g_current_submap, g_current_submap_global, g_T_map_local.matrix());
+            }
+            
+            double t_cost = omp_get_wtime() - t_start;
+            ROS_INFO_THROTTLE(1.0, 
+                "[Backend] Update OK! Cost: %.3f ms, Success: %d/%d (%.1f%%), Submap: %zu pts, Eff=%d, ResMean=%.4f m, Corr=[%.3f m, %.3f deg]",
+                t_cost * 1000,
+                g_backend_state.successful_updates,
+                g_backend_state.total_updates,
+                100.0 * g_backend_state.successful_updates / std::max(1, g_backend_state.total_updates),
+                g_current_submap_global->size(),
+                g_backend_effective_points,
+                g_backend_residual_mean,
+                corr_trans,
+                corr_rot_deg);
+
+            prev_frontend_state = data.frontend_state;
+            has_prev_frontend = true;
+            
+        } catch (const std::exception& e) {
+            ROS_ERROR("[Backend] Optimization failed: %s", e.what());
+        }
+    }
+    
+    g_backend_state.is_running = false;
+    ROS_INFO("[Backend] Backend thread stopped.");
+}
+
+
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "laserMapping");
@@ -1387,6 +2180,22 @@ int main(int argc, char** argv)
     nh.param<double>("localization/global_point_residual/cauchy_c", g_loc.gpr_cauchy_c, 0.5);
 
     nh.param<double>("localization/global_align/roi_radius", g_loc.roi_radius, 60.0);
+
+    // --- backend params ---
+    nh.param<bool>("backend/enable", g_backend_cfg.enable, false);
+    nh.param<int>("backend/min_local_points", g_backend_cfg.min_local_points, 50000);
+    nh.param<float>("backend/min_local_radius", g_backend_cfg.min_local_radius, 30.0f);
+    nh.param<int>("backend/min_frames", g_backend_cfg.min_frames, 100);
+    nh.param<float>("backend/submap_radius", g_backend_cfg.submap_radius, 25.0f);
+    nh.param<float>("backend/submap_voxel_size", g_backend_cfg.submap_voxel_size, 0.4f);
+    nh.param<int>("backend/update_interval", g_backend_cfg.update_interval, 5);
+    nh.param<float>("backend/max_point2plane_dist", g_backend_cfg.max_point2plane_dist, 1.5f);
+    nh.param<float>("backend/global_residual_weight", g_backend_cfg.global_residual_weight, 3.0f);
+    nh.param<int>("backend/max_global_points", g_backend_cfg.max_global_points, 2000);
+    
+    ROS_INFO("[Backend] enable=%d, min_points=%d, submap_radius=%.1fm, update_interval=%d",
+             g_backend_cfg.enable, g_backend_cfg.min_local_points, 
+             g_backend_cfg.submap_radius, g_backend_cfg.update_interval);
 
     // --- display ---
     p_pre->lidar_type = lidar_type;
@@ -1570,14 +2379,30 @@ int main(int argc, char** argv)
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);
     ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100000);
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100000);
-    ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odom_lio", 100000);
+    ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/frontend/Odometry", 100000);
     ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", 100000);
+
+    // ===== 后端可视化 =====
+    // ===== 后端可视化 publishers =====
+    ros::Publisher pubBackendSubmap = nh.advertise<sensor_msgs::PointCloud2>("/backend/submap", 10);
+    ros::Publisher pubBackendScanGlobal = nh.advertise<sensor_msgs::PointCloud2>("/backend/current_scan_global", 100);
+    ros::Publisher pubBackendOdom = nh.advertise<nav_msgs::Odometry>("/backend/odometry", 100);
+    ros::Publisher pubBackendPath = nh.advertise<nav_msgs::Path>("/backend/path", 100);
+    
+    nav_msgs::Path backend_path;
+    backend_path.header.frame_id = "map";
 
     ros::Subscriber ndt_init_sub = nh.subscribe<nav_msgs::Odometry>(
         "/initpose",    // 你的输入话题名
         1, 
         ndtInitPoseCallback
     );
+
+    // --- 启动后端线程 ---
+    if (g_backend_cfg.enable && g_global_ikdtree_ready) {
+        backend_thread = std::thread(backendThreadFunc);
+        ROS_INFO("[Backend] Backend thread launched.");
+    }
 
     //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
@@ -1595,18 +2420,6 @@ int main(int argc, char** argv)
             {
                 first_lidar_time = Measures.lidar_beg_time;
                 p_imu->first_lidar_time = first_lidar_time;
-                static bool initpose_applied = false;
-                if (has_ndt_init_pose && !initpose_applied)
-                {
-                    state_point = kf.get_x();
-                    state_point.rot = ndt_init_q.normalized();
-                    state_point.pos = ndt_init_t;
-                    kf.change_x(state_point);
-                    euler_cur = SO3ToEuler(state_point.rot);
-                    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-                    initpose_applied = true;
-                    ROS_INFO("[initpose] Applied /initpose as initial EKF state (first frame only).");
-                }
                 flg_first_scan = false;
                 continue;
             }
@@ -1641,7 +2454,6 @@ int main(int argc, char** argv)
 
             // 首帧初始化 ikdtree/全局对齐逻辑（保持你的原样，略去中间未改动部分）
             static bool g_first_global_align_done_local = false;
-            const bool enable_init_ndt = false;
             if (ikdtree.Root_Node == nullptr) {
                 if (feats_down_size > 5) {
                     ikdtree.set_downsample_param(filter_size_map_min);
@@ -1651,75 +2463,9 @@ int main(int argc, char** argv)
                     }
                     ikdtree.Build(feats_down_world->points);
 
-                    if (enable_init_ndt && !g_first_global_align_done_local && g_global_map_ready && !g_global_map_ds->empty()) {
-                        try {
-                            pcl::PointCloud<PointType>::Ptr src(new pcl::PointCloud<PointType>(*feats_down_world));
-                            pcl::PointCloud<PointType>::Ptr tgt(new pcl::PointCloud<PointType>(*g_global_map_ds));
-                            std::vector<int> idx;
-                            pcl::removeNaNFromPointCloud(*src, *src, idx);
-                            pcl::removeNaNFromPointCloud(*tgt, *tgt, idx);
-                            src->is_dense = true; tgt->is_dense = true;
-
-                            if (src->size() >= 10 && tgt->size() >= 100) {
-                                pcl::NormalDistributionsTransform<PointType, PointType> ndt;
-                                ndt.setResolution(2.0);
-                                ndt.setStepSize(0.2);
-                                ndt.setTransformationEpsilon(1e-3);
-                                ndt.setMaximumIterations(40);
-                                ndt.setInputTarget(tgt);
-                                ndt.setInputSource(src);
-
-                                Eigen::Matrix4f T_init = Eigen::Matrix4f::Identity();
-                                if (has_ndt_init_pose) {
-                                    // 用 odom 输入的位姿作为初值
-                                    T_init.topLeftCorner<3,3>() = ndt_init_q.toRotationMatrix().cast<float>();
-                                    T_init.block<3,1>(0,3) = ndt_init_t.cast<float>();
-                                    ROS_INFO_THROTTLE(1.0, "[NDT] Use external initial pose for NDT.");
-                                } else {
-                                    // 用原来的初值
-                                    const Eigen::Quaterniond qd = state_point.rot;
-                                    const Eigen::Vector3d td = state_point.pos;
-                                    T_init.topLeftCorner<3,3>() = qd.toRotationMatrix().cast<float>();
-                                    T_init.block<3,1>(0,3) = td.cast<float>();
-                                    ROS_INFO_THROTTLE(1.0, "[NDT] Use default state_point as initial pose for NDT.");
-                                }
-
-                                pcl::PointCloud<PointType> aligned;
-                                ndt.align(aligned, T_init);
-
-                                if (ndt.hasConverged()) {
-                                    Eigen::Matrix4f T_w_g = ndt.getFinalTransformation();
-                                    if (T_w_g.allFinite()) {
-                                        Eigen::Matrix3d R_w_g = T_w_g.topLeftCorner<3,3>().cast<double>();
-                                        Eigen::Vector3d t_w_g = T_w_g.block<3,1>(0,3).cast<double>();
-
-                                        const Eigen::Matrix3d R_old = state_point.rot.toRotationMatrix();
-                                        const Eigen::Vector3d t_old = state_point.pos;
-
-                                        // 关键：这里已经把state_point变换到全局坐标系
-                                        const Eigen::Matrix3d R_new = R_w_g * R_old;
-                                        const Eigen::Vector3d t_new = R_w_g * t_old + t_w_g;
-
-                                        state_point.rot = Eigen::Quaterniond(R_new);  // ✅ 全局坐标系
-                                        state_point.pos = t_new;                      // ✅ 全局坐标系
-                                        kf.change_x(state_point);
-
-                                        euler_cur = SO3ToEuler(state_point.rot);
-                                        pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-
-                                        g_first_global_align_done_local = true;
-                                        ROS_INFO("[global_align][NDT] first-scan alignment done. fitness=%.6f", 
-                                                ndt.getFitnessScore());
-                                    }
-                                } else {
-                                    ROS_WARN("[global_align][NDT] not converged. score=%.6f", ndt.getFitnessScore());
-                                }
-                            } else {
-                                ROS_WARN("[global_align][NDT] insufficient points: src=%zu tgt=%zu", src->size(), tgt->size());
-                            }
-                        } catch (const std::exception& e) {
-                            ROS_ERROR("[global_align][NDT] exception: %s", e.what());
-                        }
+                    if (!g_first_global_align_done_local) {
+                        g_first_global_align_done_local = true;
+                        ROS_INFO("[Frontend] First local tree built. Backend will handle global initialization.");
                     }
                 }
                 continue;
@@ -1760,6 +2506,54 @@ int main(int argc, char** argv)
 
             publish_odometry(pubOdomAftMapped);
 
+            // ===== 后端定位处理 =====
+            g_backend_state.frame_count++;
+            
+            if (shouldActivateBackend())
+            {
+                g_backend_state.update_count++;
+                
+                // 每隔 N 帧触发后端更新
+                if (g_backend_state.update_count % g_backend_cfg.update_interval == 0)
+                {
+                    V3D current_pos = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                    
+                    // 提取 submap
+                    PointCloudXYZI::Ptr submap_extracted(new PointCloudXYZI());
+                    bool extract_ok = extractSubmapFromLocal(
+                        ikdtree,
+                        current_pos,
+                        g_backend_cfg.submap_radius,
+                        submap_extracted);
+                    
+                    if (extract_ok && submap_extracted->size() > 100)
+                    {
+                        // 准备后端数据
+                        BackendData backend_data;
+                        backend_data.frontend_state = state_point;
+                        backend_data.submap = submap_extracted;
+                        backend_data.timestamp = Measures.lidar_beg_time;
+
+                        // 推送到队列
+                        {
+                            std::lock_guard<std::mutex> lock(mtx_backend);
+                            
+                            // 队列满则丢弃最旧的
+                            if (backend_queue.size() >= MAX_BACKEND_QUEUE_SIZE) {
+                                backend_queue.pop_front();
+                                ROS_WARN_THROTTLE(1.0, "[Backend] Queue full, dropping oldest data.");
+                            }
+                            
+                            backend_queue.push_back(backend_data);
+                        }
+                        cv_backend.notify_one();
+                        
+                        ROS_INFO_THROTTLE(2.0, "[Backend] Pushed data to queue. Queue size: %zu", 
+                                         backend_queue.size());
+                    }
+                }
+            }
+
             t3 = omp_get_wtime();
             map_incremental();
             t5 = omp_get_wtime();
@@ -1769,6 +2563,97 @@ int main(int argc, char** argv)
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
             // publish_effect_world(pubLaserCloudEffect);
             // publish_map(pubLaserCloudMap);
+
+            // ===== 后端可视化 =====
+            // ===== 后端可视化 =====
+            if (g_backend_state.is_active && g_backend_state.has_global_state)
+            {
+                // 1. 发布全局坐标系下的 submap
+                PointCloudXYZI::Ptr submap_global_copy(new PointCloudXYZI());
+                {
+                    std::lock_guard<std::mutex> lock(mtx_backend_vis);
+                    if (!g_current_submap_global->empty()) {
+                        *submap_global_copy = *g_current_submap_global;
+                    }
+                }
+                
+                if (!submap_global_copy->empty()) {
+                    sensor_msgs::PointCloud2 submap_msg;
+                    pcl::toROSMsg(*submap_global_copy, submap_msg);
+                    submap_msg.header.stamp = ros::Time().fromSec(lidar_end_time);
+                    submap_msg.header.frame_id = "map";
+                    pubBackendSubmap.publish(submap_msg);
+                }
+                
+                // 2. 变换当前帧到全局坐标系
+                if (feats_down_world && !feats_down_world->empty())
+                {
+                    PointCloudXYZI::Ptr current_scan_global(new PointCloudXYZI());
+                    Eigen::Isometry3d T_map_local_copy = Eigen::Isometry3d::Identity();
+
+                    {
+                        std::lock_guard<std::mutex> lock(g_mtx_TmapLocal);
+                        T_map_local_copy = g_T_map_local; // OK: Isometry3d 赋值
+                    }
+
+                    // 如果 transformPointCloudToGlobal 接受 Matrix4d，就传 matrix()
+                    transformPointCloudToGlobal(feats_down_world, current_scan_global, T_map_local_copy.matrix());
+
+                    if (!current_scan_global->empty()) {
+                        sensor_msgs::PointCloud2 scan_msg;
+                        pcl::toROSMsg(*current_scan_global, scan_msg);
+                        scan_msg.header.stamp = ros::Time().fromSec(lidar_end_time);
+                        scan_msg.header.frame_id = "map";
+                        pubBackendScanGlobal.publish(scan_msg);
+                    }
+                }
+                
+                // 3. 发布后端 odometry
+                nav_msgs::Odometry backend_odom;
+                backend_odom.header.frame_id = "map";
+                backend_odom.child_frame_id = "body_backend";
+                backend_odom.header.stamp = ros::Time().fromSec(lidar_end_time);
+                
+                backend_odom.pose.pose.position.x = g_backend_state.global_state.pos(0);
+                backend_odom.pose.pose.position.y = g_backend_state.global_state.pos(1);
+                backend_odom.pose.pose.position.z = g_backend_state.global_state.pos(2);
+                backend_odom.pose.pose.orientation.x = g_backend_state.global_state.rot.coeffs()[0];
+                backend_odom.pose.pose.orientation.y = g_backend_state.global_state.rot.coeffs()[1];
+                backend_odom.pose.pose.orientation.z = g_backend_state.global_state.rot.coeffs()[2];
+                backend_odom.pose.pose.orientation.w = g_backend_state.global_state.rot.coeffs()[3];
+                
+                pubBackendOdom.publish(backend_odom);
+                
+                // 4. 发布后端 path
+                geometry_msgs::PoseStamped backend_pose;
+                backend_pose.header = backend_odom.header;
+                backend_pose.pose = backend_odom.pose.pose;
+                
+                static int backend_path_counter = 0;
+                backend_path_counter++;
+                if (backend_path_counter % 5 == 0) {
+                    backend_path.poses.push_back(backend_pose);
+                    backend_path.header.stamp = ros::Time().fromSec(lidar_end_time);
+                    pubBackendPath.publish(backend_path);
+                }
+                
+                // 5. 打印调试信息
+                static int print_counter = 0;
+                print_counter++;
+                if (print_counter % 50 == 0) {
+                    V3D pos_frontend = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                    V3D pos_backend = g_backend_state.global_state.pos + 
+                                    g_backend_state.global_state.rot * g_backend_state.global_state.offset_T_L_I;
+                    V3D diff = pos_backend - pos_frontend;
+                    
+                    ROS_INFO("[Backend Debug] Frontend pos: [%.2f, %.2f, %.2f]", 
+                            pos_frontend.x(), pos_frontend.y(), pos_frontend.z());
+                    ROS_INFO("[Backend Debug] Backend  pos: [%.2f, %.2f, %.2f]", 
+                            pos_backend.x(), pos_backend.y(), pos_backend.z());
+                    ROS_INFO("[Backend Debug] Difference:   [%.2f, %.2f, %.2f] (norm: %.2fm)", 
+                            diff.x(), diff.y(), diff.z(), diff.norm());
+                }
+            }
 
             if (runtime_pos_log)
             {
@@ -1838,6 +2723,18 @@ int main(int argc, char** argv)
             s_vec5.push_back(s_plot[i]);
         }
         fclose(fp2);
+    }
+
+    // 停止后端线程
+    if (g_backend_cfg.enable && backend_thread.joinable()) {
+        ROS_INFO("[Backend] Stopping backend thread...");
+        {
+            std::lock_guard<std::mutex> lock(mtx_backend);
+            backend_should_stop = true;
+        }
+        cv_backend.notify_all();
+        backend_thread.join();
+        ROS_INFO("[Backend] Backend thread stopped.");
     }
 
     return 0;

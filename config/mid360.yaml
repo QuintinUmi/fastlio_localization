@@ -1,13 +1,14 @@
 common:
-    lid_topic:  "/livox/lidar_192_168_1_111"
-    imu_topic:  "/livox/imu_192_168_1_111"
-    # lid_topic:  "/livox/lidar"
-    # imu_topic:  "/livox/imu"
+    # lid_topic:  "/livox/lidar_192_168_1_111"
+    # imu_topic:  "/livox/imu_192_168_1_111"
+    lid_topic:  "/livox/lidar"
+    imu_topic:  "/livox/imu"
+    
     time_sync_en: false
     time_offset_lidar_to_imu: 0.0
 
     # 新增：双雷达开关与第二路话题
-    multi_lidar: true          # true 启用双雷达；false 单雷达（默认）
+    multi_lidar: false          # true 启用双雷达；false 单雷达（默认）
     lid_topic2: "/livox/lidar_192_168_1_194" # 第二路 LiDAR 话题（仅当 multi_lidar=true 时使用）
 
 preprocess:

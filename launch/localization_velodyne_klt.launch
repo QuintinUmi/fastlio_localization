@@ -44,7 +44,7 @@
 
 	<group if="$(arg initpose)">
 		<param name="init_pose/position" value="0.0 0.0 0.0" />
-		<param name="init_pose/orientation" value="0.0 0.0 0.0 1.0" />
+		<param name="init_pose/orientation" value="0.0 0.0 0.9990 0.0436" />
 		<node pkg="fastlio_localization" type="publish_init_pose.py" name="init_pose_pub" output="screen" />
 	</group>
 

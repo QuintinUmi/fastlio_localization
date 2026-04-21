@@ -1,7 +1,7 @@
 localization:
   map:
-    # map_file_path: "/home/quintinumi/packages/ws_fastlio_localization/src/fastlio_localization/PCD/2025-10-16-14-59-32.pcd"
-    map_file_path: "/home/quintinumi/packages/ws_fastlio_localization/src/fastlio_localization/PCD/huanchuang_tunnel2.pcd"
+    map_file_path: "/home/quintinumi/packages/ws_fastlio_localization/src/fastlio_localization/PCD/2025-10-16-14-59-32.pcd"
+    
     voxel_leaf: 0.5          # 原 0.4 -> 1.0，避免大范围地图索引溢出
     remove_outliers: false
     outlier_nb_neighbors: 20

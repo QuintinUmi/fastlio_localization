@@ -1,0 +1,76 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        // {
+        //     "name": "(gdb) 启动单个ROS节点",
+        //     "type": "cppdbg",
+        //     "request": "launch",
+        //     // 核心修改：目标程序是 bash，而不是您的节点
+        //     "program": "/bin/bash",
+        //     // 核心修改：使用 args 字段来执行一个复合命令
+        //     "args": [
+        //         "-c",
+        //         // 这个命令首先 source ROS环境，然后用 exec 启动您的节点
+        //         // exec 很重要，它让GDB能正确附加到节点进程上
+        //         "source ${workspaceFolder}/devel/setup.bash && exec ${workspaceFolder}/devel/lib/global_fusion/V1psr_dgps_doppler_fusion_ARAIM_node"
+        //     ],
+        //     "stopAtEntry": false,
+        //     "cwd": "${workspaceFolder}",
+        //     "environment": [],
+        //     "externalConsole": false,
+        //     "MIMode": "gdb",
+        //     "setupCommands": [
+        //         {
+        //             "description": "为 gdb 启用整齐打印",
+        //             "text": "-enable-pretty-printing",
+        //             "ignoreFailures": true
+        //         }
+        //     ],
+        //     "miDebuggerPath": "/usr/bin/gdb"
+        // },
+        {
+            // --- 这是我们新增的“附加”配置 ---
+            "name": "(gdb) 附加到ROS节点",
+            "type": "cppdbg",
+            "request": "attach",
+            // 目标可执行文件的路径，用于加载调试符号
+            // "program": "${workspaceFolder}/devel/lib/global_fusion/V1psr_dgps_doppler_fusion_ARAIM_node",
+            // "program": "${workspaceFolder}/devel/lib/global_fusion/V4psr_dgps_doppler_fusion_ARAIM_node",
+            "program": "${workspaceFolder}/../../devel/lib/fastlio_localization/fastlio_mapping",
+            // 使用 VSCode 的命令来弹出进程选择列表
+            "processId": "${command:pickProcess}",
+            "MIMode": "gdb",
+            // 关键：在启动这个调试会话之前，必须先执行tasks.json中定义的任务
+            // "preLaunchTask": "ROS: Launch Target Node"
+            // 加上下面这个可以避免一些不必要的日志终端
+            "logging": {
+                "engineLogging": false,
+                "programOutput": false, // 程序输出已经在它自己的终端里了
+                "exceptions": false
+            }
+            // // --- 在这里添加以下代码块 ---
+            // "setupCommands": [
+            //     {
+            //         "description": "为 gdb 启用美化打印",
+            //         "text": "-enable-pretty-printing",
+            //         "ignoreFailures": true
+            //     },
+            //     {
+            //         "description": "加载项目特定的 gdb 初始化文件",
+            //         "text": "source ${workspaceFolder}/gdb/.gdbinit",
+            //         "ignoreFailures": true
+            //     }
+            // ]
+        }
+        
+    ]
+}
+
+
+
+
+
+
+
+
+
