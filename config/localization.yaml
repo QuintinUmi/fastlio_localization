@@ -1,0 +1,94 @@
+localization:
+  map:
+    # map_file_path: "/home/quintinumi/packages/ws_fastlio_localization/src/fastlio_localization/PCD/2025-10-16-14-59-32.pcd"
+    map_file_path: "/home/quintinumi/packages/ws_fastlio_localization/src/fastlio_localization/PCD/huanchuang_tunnel2.pcd"
+    voxel_leaf: 0.5          # 原 0.4 -> 1.0，避免大范围地图索引溢出
+    remove_outliers: false
+    outlier_nb_neighbors: 20
+    outlier_stddev_mul: 2.0
+
+  ndt:
+    resolutions: [3.0, 2.0, 1.0]   # 原 [2.0,1.0,0.5] -> 略放大，先稳后精
+    max_iterations: [40, 50, 60]
+    step_size: 0.7
+    trans_eps: 1.0e-3
+    use_imu_roll_pitch_init: true
+    score_clip: 5.0                # 原 3.0 -> 5.0，避免早期误剔除
+
+  gicp:
+    enable: true
+    max_iterations: 60             # 原 40 -> 60
+    max_corr_dist: 2.0             # 原 1.5 -> 2.0
+    trans_eps: 1.0e-4
+    euclidean_fitness_epsilon: 1.0e-5
+    correspondence_randomness: 30  # 原 20 -> 30
+    use_reciprocal: true
+
+  keyframe:
+    dist_thresh: 0.8
+    yaw_thresh_deg: 8.0
+    max_count: 60
+    downsample_leaf: 0.8           # 原 0.3 -> 0.8，避免过密导致溢出和冗余
+
+  submap:
+    build_radius: 80.0             # 原 60.0 -> 80.0，更稳
+    voxel_leaf: 1.0                # 原 0.4 -> 1.0
+    min_points: 2000
+
+  scheduling:
+    use_every_frame: false
+    frame_stride: 2
+    rebuild_submap_every_n_kf: 1
+    resample_global_points_sec: 1.0
+
+  global_align:
+    roi_radius: 80.0               # 原 60.0 -> 80.0
+    use_cov_trigger: true
+    drift_trans_thresh: 3.0
+    drift_yaw_thresh_deg: 12.0
+    use_fpfh_init: false
+    fitness_thresh: 2.0            # 原 1.5 -> 2.0
+    fallback_expand_roi: 2.0       # 原 1.5 -> 2.0
+    max_roi_radius: 150.0          # 原 120.0 -> 150.0
+
+  global_point_residual:
+    enable: true
+    max_points: 600                # 原 1200 -> 600，先减载
+    voxel_leaf: 1.0                # 原 0.5 -> 1.0，防溢出
+    plane_min_neighbors: 8         # 原 10 -> 8，放宽
+    max_point2plane_dist: 0.8      # 原 0.6 -> 0.8，放宽
+    normal_angle_thresh_deg: 45.0  # 原 30 -> 45，更容易得到可用约束
+    sigma_m: 0.06
+    robust_kernel: "huber"
+    huber_delta: 0.7               # 原 0.5 -> 0.7，提高鲁棒性
+    cauchy_c: 0.5
+    weight_from_fitness:
+      enable: true
+      k: 1.0
+      eps: 0.05
+      s_min: 0.7
+      s_max: 2.5
+    orientation_binning:
+      enable: true
+      bins: 8
+      max_per_bin: 120             # 原 200 -> 120，控制单方向的点数上限
+
+  local_point_residual:
+    plane_min_neighbors: 6
+    max_point2plane_dist: 0.4      # 原 0.3 -> 0.4，稍放宽避免 “No Effective Points”
+    sigma_m: 0.07
+    robust_kernel: "none"
+
+  threading:
+    global_align_async: true
+    max_alignment_time_ms: 150      # 原 120 -> 150
+
+  performance:
+    downsample_current_frame_leaf: 0.8  # 原 0.2 -> 0.8；若你在代码中用该值进行 VoxelGrid，请同步改为 ≥0.8
+
+  debug:
+    log_level: "INFO"
+    publish_global_map: true
+    publish_submap: true
+    publish_trajectory: true
+    viz_global_map_ds_ratio: 0.2

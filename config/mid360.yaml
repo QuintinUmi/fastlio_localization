@@ -1,35 +1,85 @@
 common:
-    lid_topic:  "/livox/lidar"
-    imu_topic:  "/livox/imu"
-    time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
-    time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
-                                  # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+    lid_topic:  "/livox/lidar_192_168_1_111"
+    imu_topic:  "/livox/imu_192_168_1_111"
+    # lid_topic:  "/livox/lidar"
+    # imu_topic:  "/livox/imu"
+    time_sync_en: false
+    time_offset_lidar_to_imu: 0.0
+
+    # 新增：双雷达开关与第二路话题
+    multi_lidar: true          # true 启用双雷达；false 单雷达（默认）
+    lid_topic2: "/livox/lidar_192_168_1_194" # 第二路 LiDAR 话题（仅当 multi_lidar=true 时使用）
 
 preprocess:
-    lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
+    lidar_type: 1      # 1: Livox, 2: Velodyne, 3: Ouster
     scan_line: 4
     blind: 0.5
+    # 可选：若你的 Preprocess 使用这些键再开启（不需要可省略）
+    # timestamp_unit: 1
+    # scan_rate: 10
+    # point_filter_num: 2
+    # feature_extract_enable: false
+
+# 新增：第二路预处理参数（不写则自动沿用 preprocess 的对应值）
+preprocess2:
+    lidar_type: 1      # 默认与 preprocess.lidar_type 相同
+    scan_line: 4       # 默认与 preprocess.scan_line 相同
+    blind: 0.5         # 默认与 preprocess.blind 相同
+    # timestamp_unit: 1
+    # scan_rate: 10
+    # point_filter_num: 2
+    # feature_extract_enable: false
 
 mapping:
-    acc_cov: 0.1
-    gyr_cov: 0.1
-    b_acc_cov: 0.0001
-    b_gyr_cov: 0.0001
-    fov_degree:    360
-    det_range:     100.0
-    extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+    cube_side_length: 1000.0
+    acc_cov: 0.15
+    gyr_cov: 0.15
+    b_acc_cov: 0.0002
+    b_gyr_cov: 0.0002
+    det_range:  300.0
+    extrinsic_est_en:  false       # not supported yet for multi # true: enable the online estimation of IMU-LiDAR extrinsic only for the first LiDAR
+    
+    ## Choose between (T, R, T2, R2) OR (T, R, T_L2_wrt_L1, R_L2_wrt_L1)
+    extrinsic_imu_to_lidars: false # true: use (T, R, T2, R2), false: use (T, R, T_L2_wrt_L1, R_L2_wrt_L1)
+
     extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
-    extrinsic_R: [ 1, 0, 0,
-                   0, 1, 0,
-                   0, 0, 1]
+    extrinsic_R: [1.0, 0.0, 0.0, 
+                  0, 1, 0,
+                  0.0,  0.0, 1.0]
+    # extrinsic_T2: [ -0.011, -0.02329, 0.04412 ]
+    # extrinsic_R2: [1.0, 0.0, 0.0, 
+    #               0, 1, 0,
+    #               0.0,  0.0, 1.0]
+    extrinsic_T_L2_wrt_L1: [0.0 , 0.0, -0.55]
+
+    # extrinsic_R_L2_wrt_L1: [0.664539, -0.342020, 0.664539,
+    #                         -0.241846, -0.939693, -0.241846,
+    #                         0.707107, 0.0, -0.707107]
+    extrinsic_R_L2_wrt_L1: [0.7071, 0.0, 0.7071,
+                            0.0, -1.0, 0.0,
+                            0.7071, 0.0, -0.7071]
+    # extrinsic_R_L2_wrt_L1: [0.5471, -0.6691, 0.5015,
+    #                         -0.4554, -0.7660, -0.4554,
+    #                         0.7071, 0.0, -0.7071]
+                                
+    ## only used when publish_tf_results is true, for visualization
+    extrinsic_T_L1_wrt_drone: [0.080331, 0.0, -0.089397]     # only used when publish_tf_results is true, for visualization
+    extrinsic_R_L1_wrt_drone: [-0.7986335, 0.0, 0.6018150,   # only used when publish_tf_results is true, for visualization
+                                0, 1, 0,
+                               -0.6018150,  0.0, -0.7986335]
 
 publish:
-    path_en:  false
-    scan_publish_en:  true       # false: close all the point cloud output
-    dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
-    scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+    path_en: false
+    scan_publish_en: true
+    dense_publish_en: true
+    scan_bodyframe_pub_en: true
 
 pcd_save:
-    pcd_save_en: true
-    interval: -1                 # how many LiDAR frames saved in each pcd file; 
-                                 # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+    pcd_save_en: false
+    interval: -1
+
+runtime_pos_log_enable: true
+
+# 可选（仅当你在代码里添加了该阈值用法时启用）：双雷达帧配对时间差阈值
+# sync:
+#   l2l_max_gap: 0.05   # 单位：秒，L1/L2 末端时间差容忍阈值

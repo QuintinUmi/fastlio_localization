@@ -5,7 +5,7 @@
 #include <Eigen/Eigen>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
-#include <fast_lio/Pose6D.h>
+#include <fastlio_localization/Pose6D.h>
 #include <sensor_msgs/Imu.h>
 #include <nav_msgs/Odometry.h>
 #include <tf/transform_broadcaster.h>
@@ -33,7 +33,7 @@ using namespace Eigen;
 #define STD_VEC_FROM_EIGEN(mat)  vector<decltype(mat)::Scalar> (mat.data(), mat.data() + mat.rows() * mat.cols())
 #define DEBUG_FILE_DIR(name)     (string(string(ROOT_DIR) + "Log/"+ name))
 
-typedef fast_lio::Pose6D Pose6D;
+typedef fastlio_localization::Pose6D Pose6D;
 typedef pcl::PointXYZINormal PointType;
 typedef pcl::PointCloud<PointType> PointCloudXYZI;
 typedef vector<PointType, Eigen::aligned_allocator<PointType>>  PointVector;
@@ -52,17 +52,35 @@ M3F Eye3f(M3F::Identity());
 V3D Zero3d(0, 0, 0);
 V3F Zero3f(0, 0, 0);
 
-struct MeasureGroup     // Lidar data and imu dates for the curent process
+// 扩展后的 MeasureGroup（替换你原来的定义）
+struct MeasureGroup     // Lidar data and imu data for the current process
 {
     MeasureGroup()
     {
         lidar_beg_time = 0.0;
+        lidar_end_time = 0.0;
         this->lidar.reset(new PointCloudXYZI());
+
+        // L2 默认无数据
+        lidar2_beg_time = 0.0;
+        lidar2_end_time = 0.0;
+        this->lidar2.reset();    // 空指针表示没有第二路
+        has_lidar2 = false;
     };
+
+    // L1
     double lidar_beg_time;
     double lidar_end_time;
     PointCloudXYZI::Ptr lidar;
+
+    // IMU
     deque<sensor_msgs::Imu::ConstPtr> imu;
+
+    // L2（可选）
+    double lidar2_beg_time;      // 第二路雷达本帧起始时间
+    double lidar2_end_time;      // 第二路雷达本帧结束时间
+    PointCloudXYZI::Ptr lidar2;  // 第二路点云（nullptr 表示无）
+    bool has_lidar2;             // 是否存在第二路数据
 };
 
 struct StatesGroup
