@@ -5,10 +5,12 @@ localization:
     # map_file_path: "/home/quintinumi/git_clone/ws_double_lidar/src/FAST_LIO_MULTI/PCD/Shanghai1.pcd"
     # map_file_path: "/media/quintinumi/quintinumi/bag/20260320/scans.pcd"
     # map_file_path: "/home/quintinumi/git_clone/ws_glio_astri/src/GLIO_ASTRI/result_reclamation_short_260508/0_global_map_middle.pcd"
-    map_file_path: "/home/quintinumi/git_clone/ws_glio_astri/src/GLIO_ASTRI/result_shatin_260520_final/0_global_map_middle_ds05.pcd"  # Sha Tin (20260520) GLIO GT map (~45 M pts, 2.7x5 km extent)
+    map_file_path: "/home/quintinumi/git_clone/ws_glio_astri/src/GLIO_ASTRI/result_shatin_260520_final/0_global_map_middle_ds03.pcd"  # Sha Tin (20260520) GLIO GT map (~45 M pts, 2.7x5 km extent)
     # map_file_path: "/home/quintinumi/git_clone/ws_glio_astri/src/GLIO_ASTRI/result_klt/3_global_map_middle.pcd"
     
-    voxel_leaf: 1.0          # Sha Tin: large 2.7x5 km map -> 1.0 to avoid PCL VoxelGrid index overflow (reclamation used 0.5)
+    voxel_leaf: 0.0          # Sha Tin: SKIP global VoxelGrid (code uses ds05 @0.5 directly). VoxelGrid would
+                             # overflow int32 below leaf 0.73 on this 2.7x5km extent; ikd-tree has no such limit, so
+                             # keep the finer 0.5 m map -> better reloc accuracy (1.0 m -> ~0.5 m slide was the limit).
     remove_outliers: false
     outlier_nb_neighbors: 20
     outlier_stddev_mul: 2.0
@@ -59,10 +61,10 @@ localization:
 
   global_point_residual:
     enable: true
-    max_points: 600                # 原 1200 -> 600，先减载
-    voxel_leaf: 1.0                # 原 0.5 -> 1.0，防溢出
+    max_points: 600                # stable (1200 destabilized the filter -> divergence)
+    voxel_leaf: 0.5                # finer global-residual matching (was 1.0); the ikd-tree global map is 0.5 m
     plane_min_neighbors: 8         # 原 10 -> 8，放宽
-    max_point2plane_dist: 0.8      # 原 0.6 -> 0.8，放宽
+    max_point2plane_dist: 0.8      # stable (0.5 starved matches -> divergence)
     normal_angle_thresh_deg: 45.0  # 原 30 -> 45，更容易得到可用约束
     sigma_m: 0.06
     robust_kernel: "huber"
@@ -77,7 +79,7 @@ localization:
     orientation_binning:
       enable: true
       bins: 8
-      max_per_bin: 120             # 原 200 -> 120，控制单方向的点数上限
+      max_per_bin: 120             # stable
 
   local_point_residual:
     plane_min_neighbors: 6

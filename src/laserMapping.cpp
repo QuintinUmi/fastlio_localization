@@ -123,6 +123,11 @@ pcl::KdTreeFLANN<PointType>::Ptr g_kdtree_global(new pcl::KdTreeFLANN<PointType>
 // 标记是否加载成功
 bool g_global_map_ready = false;
 bool g_first_global_align_done = false;
+// --- relocalization per-frame debug (written to dbg.txt + throttled console) ---
+int    g_dbg_rg_cnt    = 0;     // # global-map point-to-plane residuals kept this frame (high = well anchored to GLIO map)
+double g_dbg_rg_mean   = -1.0;  // mean global residual (m); small = good alignment
+int    g_dbg_local_eff = 0;     // # local (ikd-tree) residuals
+int    g_dbg_glob_eff  = 0;     // # global residuals entering the EKF update
 bool g_global_ikdtree_ready = false;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -723,11 +728,18 @@ bool LoadGlobalMapAndBuildIndex()
         ROS_ERROR("[localization] Failed to load PCD: %s", g_loc.map_file_path.c_str());
         return false;
     }
-    // 体素降采样
-    pcl::VoxelGrid<PointType> vg;
-    vg.setLeafSize(g_loc.map_voxel_leaf, g_loc.map_voxel_leaf, g_loc.map_voxel_leaf);
-    vg.setInputCloud(g_global_map_raw);
-    vg.filter(*g_global_map_ds);
+    // 体素降采样。leaf<=0 时跳过 VoxelGrid，直接用已降采样的地图（如 ds05@0.5）。
+    // 大范围地图(2.7x5km)在 leaf<0.73 时 PCL VoxelGrid 的 int32 体素索引会溢出，
+    // 故对已是 0.5m 的二进制图直接跳过全局体素，保留 0.5m 分辨率以提升重定位精度。
+    if (g_loc.map_voxel_leaf <= 0.0) {
+        *g_global_map_ds = *g_global_map_raw;
+        ROS_INFO("[localization] map_voxel_leaf<=0 -> skip global VoxelGrid, keep input resolution (%zu pts)", g_global_map_raw->size());
+    } else {
+        pcl::VoxelGrid<PointType> vg;
+        vg.setLeafSize(g_loc.map_voxel_leaf, g_loc.map_voxel_leaf, g_loc.map_voxel_leaf);
+        vg.setInputCloud(g_global_map_raw);
+        vg.filter(*g_global_map_ds);
+    }
 
     // 可选统计滤波
     if (g_loc.map_remove_outliers) {
@@ -1157,6 +1169,12 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             global_kept++;
         }
     }
+
+    // expose per-frame relocalization diagnostics (read in the main loop for dbg.txt / console)
+    g_dbg_rg_cnt    = rg_kept_cnt;
+    g_dbg_rg_mean   = (rg_kept_cnt > 0) ? (sum_rg_kept / (double)rg_kept_cnt) : -1.0;
+    g_dbg_local_eff = effct_feat_num;
+    g_dbg_glob_eff  = effct_feat_num_global;
 
     const int total_eff = effct_feat_num + effct_feat_num_global;
     if (total_eff < 1)
@@ -1776,6 +1794,19 @@ int main(int argc, char** argv)
             double t_update_end = omp_get_wtime();
 
             publish_odometry(pubOdomAftMapped);
+
+            // --- relocalization per-frame debug: TUM pose + global-map anchoring ---
+            // dbg.txt cols: time x y z qx qy qz qw  global_match_cnt  global_mean_resid  local_eff  global_eff
+            fout_dbg << std::fixed << std::setprecision(6)
+                     << lidar_end_time << " "
+                     << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2) << " "
+                     << geoQuat.x << " " << geoQuat.y << " " << geoQuat.z << " " << geoQuat.w << " "
+                     << g_dbg_rg_cnt << " " << g_dbg_rg_mean << " "
+                     << g_dbg_local_eff << " " << g_dbg_glob_eff << "\n";
+            fout_dbg.flush();
+            ROS_INFO_THROTTLE(1.0, "[reloc] pos=(%.2f,%.2f,%.2f) | GLOBAL match=%d mean=%.3fm | local=%d | global_eff=%d",
+                              state_point.pos(0), state_point.pos(1), state_point.pos(2),
+                              g_dbg_rg_cnt, g_dbg_rg_mean, g_dbg_local_eff, g_dbg_glob_eff);
 
             t3 = omp_get_wtime();
             map_incremental();
