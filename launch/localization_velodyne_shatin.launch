@@ -1,11 +1,11 @@
 <launch>
-<!-- Launch file for Livox MID360 LiDAR -->
+<!-- Sha Tin (20260520) relocalization vs the GLIO GT map; Velodyne-32 + /imu/data -->
 
 	<arg name="rviz" default="true" />
 	<arg name="initpose" default="true" />
 
 	<rosparam command="load" file="$(find fastlio_localization)/config/velodyne.yaml" />
-	<rosparam command="load" file="$(find fastlio_localization)/config/localization_stf.yaml" />
+	<rosparam command="load" file="$(find fastlio_localization)/config/localization_shatin.yaml" />
 
 	<param name="feature_extract_enable" type="bool" value="0"/>
 	<param name="point_filter_num" type="int" value="3"/>
@@ -43,8 +43,8 @@
 	</group>
 
 	<group if="$(arg initpose)">
-		<param name="init_pose/position" value="0.0 0.0 0.0" />
-		<param name="init_pose/orientation" value="0.0 0.0 0.9781 -0.2079" />
+		<param name="init_pose/position" value="0.38 0.04 -0.16" />        <!-- route start = GLIO map origin -->
+		<param name="init_pose/orientation" value="-0.003565 -0.006649 -0.960469 0.278285" />   <!-- GLIO start IMU-body orientation (yaw -147.7 deg) -->
 		<node pkg="fastlio_localization" type="publish_init_pose.py" name="init_pose_pub" output="screen" />
 	</group>
 

@@ -78,6 +78,7 @@ double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 static bool g_local_tree_empty = false;
+int local_init_min_points = 1500;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -965,6 +966,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
     // === 新增：用于判定是否持续清空 local 树的状态（带滞回） ===
     static bool keep_clearing_local_tree = false; // true 表示本帧结束要清空 local 树
+    static bool local_reinit_pending = false;
     // 设定滞回阈值：global 残差 <= good_thresh 视为“好”，> bad_thresh 视为“差”
     const double good_thresh = std::max(0.15, 0.35 * (double)g_loc.gpr_max_point2plane_dist);
     const double bad_thresh  = std::max(0.2 , 0.60 * (double)g_loc.gpr_max_point2plane_dist);
@@ -981,6 +983,18 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     // 新增：统计“将要进入观测的全局残差”的累加器
     double sum_rg_kept = 0.0;
     int    rg_kept_cnt = 0;
+
+    // 本地 map 处于重建期时，先累积足够点云再使用 local 匹配
+    if (g_local_tree_empty && !keep_clearing_local_tree)
+    {
+        const int local_size = ikdtree.validnum();
+        if (local_size >= local_init_min_points)
+        {
+            g_local_tree_empty = false;
+            ROS_INFO_THROTTLE(0.5, "[LOCAL TREE] reinit done (size=%d >= %d), enable local matching.",
+                              local_size, local_init_min_points);
+        }
+    }
 
     // 第一轮：坐标转换与邻域搜索、平面估计
     #ifdef MP_EN
@@ -1002,7 +1016,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         // 局部匹配
         {
-            if (!g_local_tree_empty || true) {
+            if (!g_local_tree_empty) {
                 std::vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
                 auto &points_near_local = Nearest_Points[i];
 
@@ -1169,6 +1183,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             if (!keep_clearing_local_tree) {
                 ROS_WARN_THROTTLE(0.5, "[LOCAL TREE] global residual bad (%.3f > %.3f), start clearing local tree.",
                                   (float)mean_rg_kept, (float)bad_thresh);
+                local_reinit_pending = true;
             }
             keep_clearing_local_tree = true;
         }
@@ -1257,7 +1272,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - t_solve_begin;
 
     // === 关键：在求解完成后，根据 keep_clearing_local_tree 决定是否清空本地 IKD-Tree ===
-    if (keep_clearing_local_tree)
+    if (local_reinit_pending)
     {
         // 用当前帧有效特征点重建local tree
         using TreeT = KD_TREE<PointType>;
@@ -1271,7 +1286,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             new_pts.push_back(feats_down_world->points[i]);
         }
         ikdtree.Build(new_pts);        // 用当前帧特征点重建local-tree!
-        g_local_tree_empty = false;    // 标记为非空
+        g_local_tree_empty = true;     // 标记为空，等待累积足够点云
+        local_reinit_pending = false;
 
         s_boost_frames = std::max(s_boost_frames, 8);
 
@@ -1344,6 +1360,7 @@ int main(int argc, char** argv)
     nh.param<double>("mapping/acc_cov", acc_cov, 0.1);
     nh.param<double>("mapping/b_gyr_cov", b_gyr_cov, 0.0001);
     nh.param<double>("mapping/b_acc_cov", b_acc_cov, 0.0001);
+    nh.param<int>("mapping/local_init_min_points", local_init_min_points, 1500);
 
     // --- extrinsic (IMU->L1) ---
     std::vector<double> extrinT(3, 0.0), extrinR(9, 0.0);
