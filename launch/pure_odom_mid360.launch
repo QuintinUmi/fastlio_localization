@@ -1,0 +1,17 @@
+<launch>
+<!-- PURE FAST-LIO odometry for kia MID360: NO global map, NO backend. Publishes
+     /Odom_lio (body pose) + /cloud_registered_body (deskewed body-frame scan) for the
+     GLIO FastlioAdapter (kia GT-anchored mapping). -->
+	<rosparam command="load" file="$(find fastlio_localization)/config/mid360.yaml" />
+	<param name="feature_extract_enable" type="bool" value="0"/>
+	<param name="point_filter_num" type="int" value="1"/>   <!-- keep all points: map quality -->
+	<param name="max_iteration" type="int" value="3" />
+	<param name="filter_size_surf" type="double" value="0.25" />
+	<param name="filter_size_map" type="double" value="0.25" />
+	<param name="cube_side_length" type="double" value="1000" />
+	<param name="runtime_pos_log_enable" type="bool" value="0" />
+	<node pkg="fastlio_localization" type="fastlio_mapping" name="laserMapping" output="screen" />
+	<group ns="backend">
+		<param name="enable" value="false"/>
+	</group>
+</launch>

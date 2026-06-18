@@ -1,275 +1,178 @@
-## Related Works and Extended Application
+# FAST-LIO Localization — prior-map relocalization
 
-**SLAM:**
+A LiDAR-inertial **map-based relocalization** package built on
+[FAST-LIO2](https://github.com/hku-mars/FAST_LIO) (HKU-MARS). The original FAST-LIO builds a
+map online; this fork adds a **localization mode** that loads a *prior* point-cloud map and
+keeps the platform globally registered to it in real time. A tooling layer (`tools/`) can
+also compute the initial pose automatically from post-processed navigation data.
 
-1. [ikd-Tree](https://github.com/hku-mars/ikd-Tree): A state-of-art dynamic KD-Tree for 3D kNN search.
-2. [R2LIVE](https://github.com/hku-mars/r2live): A high-precision LiDAR-inertial-Vision fusion work using FAST-LIO as LiDAR-inertial front-end.
-3. [LI_Init](https://github.com/hku-mars/LiDAR_IMU_Init): A robust, real-time LiDAR-IMU extrinsic initialization and synchronization package..
-4. [FAST-LIO-LOCALIZATION](https://github.com/HViktorTsoi/FAST_LIO_LOCALIZATION): The integration of FAST-LIO with **Re-localization** function module.
-5. [FAST-LIVO](https://github.com/hku-mars/FAST-LIVO) | [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2): A state-of-art LiDAR-inertial-visual odometry (LIVO) system with high computational efficiency, robustness, and pixel-level accuracy.
+Validated on a multi-vehicle 2026 dataset (Velodyne-32 and Livox MID360) relocalizing
+against a stitched city-scale map: scan-to-map plane residual ≈ 0.03–0.07 m.
 
-**Control and Plan:**
+> Research fork. The LiDAR-inertial odometry core (iEKF, ikd-Tree, IMU preintegration) is
+> FAST-LIO2; please cite the upstream papers (see *Acknowledgements*). The original upstream
+> README is kept as `README_fastlio_upstream.md`.
 
-1. [IKFOM](https://github.com/hku-mars/IKFoM): A Toolbox for fast and high-precision on-manifold Kalman filter.
-2. [UAV Avoiding Dynamic Obstacles](https://github.com/hku-mars/dyn_small_obs_avoidance): One of the implementation of FAST-LIO in robot's planning.
-3. [UGV Demo](https://www.youtube.com/watch?v=wikgrQbE6Cs): Model Predictive Control for Trajectory Tracking on Differentiable Manifolds.
-4. [Bubble Planner](https://arxiv.org/abs/2202.12177): Planning High-speed Smooth Quadrotor Trajectories using Receding Corridors.
+---
 
-<!-- 10. [**FAST-LIVO**](https://github.com/hku-mars/FAST-LIVO): Fast and Tightly-coupled Sparse-Direct LiDAR-Inertial-Visual Odometry. -->
+## 1. How it works
 
-## FAST-LIO
-**FAST-LIO** (Fast LiDAR-Inertial Odometry) is a computationally efficient and robust LiDAR-inertial odometry package. It fuses LiDAR feature points with IMU data using a tightly-coupled iterated extended Kalman filter to allow robust navigation in fast-motion, noisy or cluttered environments where degeneration occurs. Our package address many key issues:
-1. Fast iterated Kalman filter for odometry optimization;
-2. Automaticaly initialized at most steady environments;
-3. Parallel KD-Tree Search to decrease the computation;
+The core idea is simple: **the prior PCD map is loaded into a dedicated ikd-Tree at startup,
+and from then on every scan is registered against it with the same point-to-plane residual
+and on-manifold iterated-EKF optimization that FAST-LIO already uses** — only the tree holds
+the *prior* map instead of an online-accumulated one. No separate registration pipeline is
+introduced; localization is just FAST-LIO's optimization running against the loaded map.
 
-## FAST-LIO 2.0 (2021-07-05 Update)
-<!-- ![image](doc/real_experiment2.gif) -->
-<!-- [![Watch the video](doc/real_exp_2.png)](https://youtu.be/2OvjGnxszf8) -->
-<div align="left">
-<img src="doc/real_experiment2.gif" width=49.6% />
-<img src="doc/ulhkwh_fastlio.gif" width = 49.6% >
-</div>
+```
+ prior map PCD ─► ikd-Tree (prior map)
+                        ▲
+ LiDAR ─► preprocess ─► point-to-plane residual ─►┐
+ IMU   ─► preintegration ─────────────────────────┤ iterated EKF ─► /Odom_lio (pose in MAP frame)
+ /initpose (initial pose, once) ──────────────────┘
+```
 
-**Related video:**  [FAST-LIO2](https://youtu.be/2OvjGnxszf8),  [FAST-LIO1](https://youtu.be/iYCY6T79oNU)
+* **Initialization** — the first scan needs a global pose: publish it once on `/initpose`
+  (`nav_msgs/Odometry`, latched), or let NDT coarse-align the first scans to the map.
+* **Tracking** — the iEKF fuses IMU preintegration with the scan↔prior-map plane residual
+  every frame, so the estimate stays locked to the map datum.
+* **Drift backstop (optional)** — an asynchronous backend periodically re-aligns the current
+  scan to the map and corrects slow drift on long / geometry-poor stretches.
 
-**Pipeline:**
-<div align="center">
-<img src="doc/overview_fastlio2.svg" width=99% />
-</div>
+`/Odom_lio` is the IMU-body pose **in the prior-map ENU frame**; save it to TUM for
+evaluation.
 
-**New Features:**
-1. Incremental mapping using [ikd-Tree](https://github.com/hku-mars/ikd-Tree), achieve faster speed and over 100Hz LiDAR rate.
-2. Direct odometry (scan to map) on Raw LiDAR points (feature extraction can be disabled), achieving better accuracy.
-3. Since no requirements for feature extraction, FAST-LIO2 can support many types of LiDAR including spinning (Velodyne, Ouster) and solid-state (Livox Avia, Horizon, MID-70) LiDARs, and can be easily extended to support more LiDARs.
-4. Support external IMU.
-5. Support ARM-based platforms including Khadas VIM3, Nivida TX2, Raspberry Pi 4B(8G RAM).
-
-**Related papers**: 
-
-[FAST-LIO2: Fast Direct LiDAR-inertial Odometry](doc/Fast_LIO_2.pdf)
-
-[FAST-LIO: A Fast, Robust LiDAR-inertial Odometry Package by Tightly-Coupled Iterated Kalman Filter](https://arxiv.org/abs/2010.08196)
-
-**Contributors**
-
-[Wei Xu 徐威](https://github.com/XW-HKU)，[Yixi Cai 蔡逸熙](https://github.com/Ecstasy-EC)，[Dongjiao He 贺东娇](https://github.com/Joanna-HE)，[Fangcheng Zhu 朱方程](https://github.com/zfc-zfc)，[Jiarong Lin 林家荣](https://github.com/ziv-lin)，[Zheng Liu 刘政](https://github.com/Zale-Liu), [Borong Yuan](https://github.com/borongyuan)
-
-<!-- <div align="center">
-    <img src="doc/results/HKU_HW.png" width = 49% >
-    <img src="doc/results/HKU_MB_001.png" width = 49% >
-</div> -->
-
-## 1. Prerequisites
-### 1.1 **Ubuntu** and **ROS**
-**Ubuntu >= 16.04**
-
-For **Ubuntu 18.04 or higher**, the **default** PCL and Eigen is enough for FAST-LIO to work normally.
-
-ROS    >= Melodic. [ROS Installation](http://wiki.ros.org/ROS/Installation)
-
-### 1.2. **PCL && Eigen**
-PCL    >= 1.8,   Follow [PCL Installation](http://www.pointclouds.org/downloads/linux.html).
-
-Eigen  >= 3.3.4, Follow [Eigen Installation](http://eigen.tuxfamily.org/index.php?title=Main_Page).
-
-### 1.3. **livox_ros_driver**
-Follow [livox_ros_driver Installation](https://github.com/Livox-SDK/livox_ros_driver).
-
-*Remarks:*
-- Since the FAST-LIO must support Livox serials LiDAR firstly, so the **livox_ros_driver** must be installed and **sourced** before run any FAST-LIO luanch file.
-- How to source? The easiest way is add the line ``` source $Livox_ros_driver_dir$/devel/setup.bash ``` to the end of file ``` ~/.bashrc ```, where ``` $Livox_ros_driver_dir$ ``` is the directory of the livox ros driver workspace (should be the ``` ws_livox ``` directory if you completely followed the livox official document).
-
+---
 
 ## 2. Build
-If you want to use docker conatiner to run fastlio2, please install the docker on you machine.
-Follow [Docker Installation](https://docs.docker.com/engine/install/ubuntu/).
-### 2.1 Docker Container
-User can create a new script with anyname by the following command in linux:
-```
-touch <your_custom_name>.sh
-```
-Place the following code inside the ``` <your_custom_name>.sh ``` script.
-```
-#!/bin/bash
-mkdir docker_ws
-# Script to run ROS Kinetic with GUI support in Docker
 
-# Allow X server to be accessed from the local machine
-xhost +local:
+ROS1 (Noetic). Depends on PCL, Eigen, `livox_ros_driver(2)` (for Livox), and the bundled
+`IKFoM` / `ikd-Tree` headers.
 
-# Container name
-CONTAINER_NAME="fastlio2"
-
-# Run the Docker container
-docker run -itd \
-  --name=$CONTAINER_NAME \
-  --user mars_ugv \
-  --network host \
-  --ipc=host \
-  -v /home/$USER/docker_ws:/home/mars_ugv/docker_ws \
-  --privileged \
-  --env="QT_X11_NO_MITSHM=1" \
-  --volume="/etc/localtime:/etc/localtime:ro" \
-  -v /dev/bus/usb:/dev/bus/usb \
-  --device=/dev/dri \
-  --group-add video \
-  -v /tmp/.X11-unix:/tmp/.X11-unix \
-  --env="DISPLAY=$DISPLAY" \
-  kenny0407/marslab_fastlio2:latest \
-  /bin/bash
-```
-execute the following command to grant execute permissions to the script, making it runnable:
-```
-sudo chmod +x <your_custom_name>.sh
-```
-execute the following command to download the image and create the container.
-```
-./<your_custom_name>.sh
+```bash
+# from your catkin workspace root
+catkin_make            # or: catkin build
+source devel/setup.bash
 ```
 
-*Script explanation:*
-- The docker run command provided below creates a container with a tag, using an image from Docker Hub. The download duration for this image can differ depending on the user's network speed.
-- This command also establishes a new workspace called ``` docker_ws ```, which serves as a shared folder between the Docker container and the host machine. This means that if users wish to run the rosbag example, they need to download the rosbag file and place it in the ``` docker_ws ``` directory on their host machine.
-- Subsequently, a folder with the same name inside the Docker container will receive this file. Users can then easily play the file within Docker.
-- In this example, we've shared the network of the host machine with the Docker container. Consequently, if users execute the ``` rostopic list ``` command, they will observe identical output whether they run it on the host machine or inside the Docker container."
-### 2.2 Build from source
-Clone the repository and catkin_make:
+Executable: `fastlio_mapping` (node name `laserMapping` in the launch files).
+
+---
+
+## 3. Workflow
+
+### 3.1 Build a prior map (mapping mode)
+Run FAST-LIO mapping (or pure odometry) over a mapping log and save the cloud:
+```bash
+roslaunch fastlio_localization mapping_velodyne.launch      # or mapping_* / pure_odom_*
+```
+Any point-cloud map in an ENU frame works (it may also come from an external mapper). Note
+the map's **ENU origin** `(lat0, lon0, h0)` — it defines the localization frame.
+
+### 3.2 Relocalize on the prior map (localization mode)
+Point the config at your map and play the log:
+```bash
+# terminal 1: node (loads map, waits for first scan / initpose)
+roslaunch fastlio_localization reloc_unified_velodyne.launch       # velodyne
+roslaunch fastlio_localization reloc_unified_mid360.launch         # livox mid360
+#   or reloc_single_{velodyne,mid360}.launch map:=/path/to/map.pcd
+
+# terminal 2: provide an initial pose, then play
+rosparam set /init_pose/position "X Y Z"
+rosparam set /init_pose/orientation "qx qy qz qw"
+rosrun fastlio_localization publish_init_pose.py
+rosbag play --topics <LIDAR> <IMU> -- your.bag
+```
+Wait for `Global map loaded` before playing. `/Odom_lio` is the localized trajectory.
+
+### 3.3 Automated run with computed initial pose
+`tools/` computes the initial pose from post-processed navigation data and orchestrates the
+whole run (start node → wait for map → publish `/initpose` → play bag(s) → record
+`/Odom_lio` → TUM):
+```bash
+cd tools
+python3 gt_init_pose.py --car kia  --bag your.bag                 # print init pose only
+python3 run_reloc.py    --car honda --bag your.bag --out out_dir  # full pipeline
+```
+See `tools/README.md` for the init-pose math and pipeline details.
+
+---
+
+## 4. Configuration
+
+Two YAMLs are loaded per run: a **sensor** config and a **localization** config.
+
+**Sensor** (`config/velodyne*.yaml`, `config/mid360.yaml`, `config/ouster64.yaml`, …):
+`lid_topic`, `imu_topic`, `lidar_type`, `scan_line`, extrinsic LiDAR→IMU, and
+`preprocess/timestamp_unit`.
+
+**Localization** (`config/localization*.yaml`):
+* `map/map_file_path`, `map/voxel_leaf` (0 = keep input resolution; avoids int32 VoxelGrid
+  overflow on city-scale maps);
+* `ndt/*` coarse-align resolutions/iterations;
+* `global_point_residual/*` (scan↔prior-map factor: `max_points`, `voxel_leaf`,
+  `max_point2plane_dist`, `robust_kernel`, fitness weighting);
+* `local_point_residual/*`, `submap/*`, `global_align/*`, `threading/*`, `debug/*`.
+
+`config/localization_unified*.yaml` target the stitched city map; `_honda` is a more robust
+variant (larger `max_point2plane_dist`, Huber) for harder logs.
+
+---
+
+## 5. Launch files
+
+| Launch | Purpose |
+|---|---|
+| `mapping_*.launch` | online mapping (avia/horizon/ouster64/velodyne/marsim) |
+| `pure_odom_{velodyne,mid360}.launch` | map-less odometry (front-end / map building source) |
+| `reloc_unified_{velodyne,mid360}.launch` | relocalize on the unified map, **no rviz** (batch) |
+| `reloc_single_{velodyne,mid360}.launch` | relocalize on a single map via `map:=` |
+| `reloc_{honda,kia}_rviz*.launch` | relocalize **with rviz**, init pose via `px/py/pz/qx..qw` args |
+| `localization_*_*.launch` | scene-specific localization presets |
+
+---
+
+## 6. Conventions & pitfalls (validated the hard way)
+
+- **Map frame is ENU at the map origin.** `/Odom_lio` and `/initpose` are in this frame.
+- **Init z = map datum (0), not ellipsoidal height** — they can differ by several metres;
+  using ellipsoidal height destabilizes vertical convergence.
+- **Body mounting yaw offset matters.** A Y-forward LiDAR/IMU body (e.g. a Velodyne mounted
+  Y-forward) needs init `yaw = course − 90°`; an X-forward body needs `0°`. Wrong offset →
+  the estimate drifts sideways while yaw *looks* correct.
+- **Tilted sensors need a full 3-axis init orientation**, not yaw-only, or IMU/gravity
+  preintegration diverges on the first frames.
+- **Deskew time unit**: set `preprocess/timestamp_unit` to match the per-point `time` field
+  (Velodyne `/velodyne_points` in **seconds** → unit 0; microseconds → 2). A wrong unit
+  causes divergence only once the platform moves.
+- **Evaluate in 2D horizontal** when the GT vertical datum differs from the map; account for
+  the per-log clock offset before computing APE.
+
+---
+
+## 7. Outputs
+
+- `/Odom_lio` — localized IMU-body pose in the map ENU frame (save to TUM for evo).
+- `/cloud_registered`, `/cloud_registered_body` — deskewed scan (map / body frame).
+- `/global_map`, `/submap`, `/path` — visualization (rviz config in `rviz_cfg/`).
+
+---
+
+## 8. Repository layout
 
 ```
-    cd ~/$A_ROS_DIR$/src
-    git clone https://github.com/hku-mars/FAST_LIO.git
-    cd FAST_LIO
-    git submodule update --init
-    cd ../..
-    catkin_make
-    source devel/setup.bash
-```
-- Remember to source the livox_ros_driver before build (follow 1.3 **livox_ros_driver**)
-- If you want to use a custom build of PCL, add the following line to ~/.bashrc
-```export PCL_ROOT={CUSTOM_PCL_PATH}```
-## 3. Directly run
-Noted:
-
-A. Please make sure the IMU and LiDAR are **Synchronized**, that's important.
-
-B. The warning message "Failed to find match for field 'time'." means the timestamps of each LiDAR points are missed in the rosbag file. That is important for the forward propagation and backwark propagation.
-
-C. We recommend to set the **extrinsic_est_en** to false if the extrinsic is give. As for the extrinsic initiallization, please refer to our recent work: [**Robust Real-time LiDAR-inertial Initialization**](https://github.com/hku-mars/LiDAR_IMU_Init).
-
-### 3.1 For Avia
-Connect to your PC to Livox Avia LiDAR by following  [Livox-ros-driver installation](https://github.com/Livox-SDK/livox_ros_driver), then
-```
-    cd ~/$FAST_LIO_ROS_DIR$
-    source devel/setup.bash
-    roslaunch fast_lio mapping_avia.launch
-    roslaunch livox_ros_driver livox_lidar_msg.launch
-```
-- For livox serials, FAST-LIO only support the data collected by the ``` livox_lidar_msg.launch ``` since only its ``` livox_ros_driver/CustomMsg ``` data structure produces the timestamp of each LiDAR point which is very important for the motion undistortion. ``` livox_lidar.launch ``` can not produce it right now.
-- If you want to change the frame rate, please modify the **publish_freq** parameter in the [livox_lidar_msg.launch](https://github.com/Livox-SDK/livox_ros_driver/blob/master/livox_ros_driver/launch/livox_lidar_msg.launch) of [Livox-ros-driver](https://github.com/Livox-SDK/livox_ros_driver) before make the livox_ros_driver pakage.
-
-### 3.2 For Livox serials with external IMU
-
-mapping_avia.launch theratically supports mid-70, mid-40 or other livox serial LiDAR, but need to setup some parameters befor run:
-
-Edit ``` config/avia.yaml ``` to set the below parameters:
-
-1. LiDAR point cloud topic name: ``` lid_topic ```
-2. IMU topic name: ``` imu_topic ```
-3. Translational extrinsic: ``` extrinsic_T ```
-4. Rotational extrinsic: ``` extrinsic_R ``` (only support rotation matrix)
-- The extrinsic parameters in FAST-LIO is defined as the LiDAR's pose (position and rotation matrix) in IMU body frame (i.e. the IMU is the base frame). They can be found in the official manual.
-- FAST-LIO produces a very simple software time sync for livox LiDAR, set parameter ```time_sync_en``` to ture to turn on. But turn on **ONLY IF external time synchronization is really not possible**, since the software time sync cannot make sure accuracy.
-
-### 3.3 For Velodyne or Ouster (Velodyne as an example)
-
-Step A: Setup before run
-
-Edit ``` config/velodyne.yaml ``` to set the below parameters:
-
-1. LiDAR point cloud topic name: ``` lid_topic ```
-2. IMU topic name: ``` imu_topic ``` (both internal and external, 6-aixes or 9-axies are fine)
-3. Set the parameter ```timestamp_unit``` based on the unit of **time** (Velodyne) or **t** (Ouster) field in PoindCloud2 rostopic
-4. Line number (we tested 16, 32 and 64 line, but not tested 128 or above): ``` scan_line ```
-5. Translational extrinsic: ``` extrinsic_T ```
-6. Rotational extrinsic: ``` extrinsic_R ``` (only support rotation matrix)
-- The extrinsic parameters in FAST-LIO is defined as the LiDAR's pose (position and rotation matrix) in IMU body frame (i.e. the IMU is the base frame).
-
-Step B: Run below
-```
-    cd ~/$FAST_LIO_ROS_DIR$
-    source devel/setup.bash
-    roslaunch fast_lio mapping_velodyne.launch
+config/    sensor + localization YAMLs
+launch/    mapping / pure-odom / relocalization launch files
+scripts/   publish_init_pose.py (/initpose helper)
+src/       laserMapping.cpp (node), preprocess, IMU_Processing
+tools/     init-pose pipeline (geo.py, gtlib.py, gt_init_pose.py, run_reloc.py)
+msg/       Pose6D.msg
 ```
 
-Step C: Run LiDAR's ros driver or play rosbag.
+---
 
-### 3.4 For MARSIM Simulator
+## 9. Acknowledgements
 
-Install MARSIM: https://github.com/hku-mars/MARSIM and run MARSIM as below
-
-```
-cd ~/$MARSIM_ROS_DIR$
-roslaunch test_interface single_drone_avia.launch
-```
-
-Then Run FAST-LIO:
-
-```
-roslaunch fast_lio mapping_marsim.launch
-```
-
-### 3.5 PCD file save
-
-Set ``` pcd_save_enable ``` in launchfile to ``` 1 ```. All the scans (in global frame) will be accumulated and saved to the file ``` FAST_LIO/PCD/scans.pcd ``` after the FAST-LIO is terminated. ```pcl_viewer scans.pcd``` can visualize the point clouds.
-
-*Tips for pcl_viewer:*
-- change what to visualize/color by pressing keyboard 1,2,3,4,5 when pcl_viewer is running. 
-```
-    1 is all random
-    2 is X values
-    3 is Y values
-    4 is Z values
-    5 is intensity
-```
-
-## 4. Rosbag Example
-### 4.1 Livox Avia Rosbag
-<div align="left">
-<img src="doc/results/HKU_LG_Indoor.png" width=47% />
-<img src="doc/results/HKU_MB_002.png" width = 51% >
-
-Files: Can be downloaded from [google drive](https://drive.google.com/drive/folders/1CGYEJ9-wWjr8INyan6q1BZz_5VtGB-fP?usp=sharing)
-
-Run:
-```
-roslaunch fast_lio mapping_avia.launch
-rosbag play YOUR_DOWNLOADED.bag
-
-```
-
-### 4.2 Velodyne HDL-32E Rosbag
-
-**NCLT Dataset**: Original bin file can be found [here](http://robots.engin.umich.edu/nclt/).
-
-We produce [Rosbag Files](https://drive.google.com/drive/folders/1blQJuAB4S80NwZmpM6oALyHWvBljPSOE?usp=sharing) and [a python script](https://drive.google.com/file/d/1QC9IRBv2_-cgo_AEvL62E1ml1IL9ht6J/view?usp=sharing) to generate Rosbag files: ```python3 sensordata_to_rosbag_fastlio.py bin_file_dir bag_name.bag```
-    
-Run:
-```
-roslaunch fast_lio mapping_velodyne.launch
-rosbag play YOUR_DOWNLOADED.bag
-```
-
-## 5.Implementation on UAV
-In order to validate the robustness and computational efficiency of FAST-LIO in actual mobile robots, we build a small-scale quadrotor which can carry a Livox Avia LiDAR with 70 degree FoV and a DJI Manifold 2-C onboard computer with a 1.8 GHz Intel i7-8550U CPU and 8 G RAM, as shown in below.
-
-The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file will be open-sourced in the future.
-
-<div align="center">
-    <img src="doc/uav01.jpg" width=40.5% >
-    <img src="doc/uav_system.png" width=57% >
-</div>
-
-## 6.Acknowledgments
-
-Thanks for LOAM(J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time), [Livox_Mapping](https://github.com/Livox-SDK/livox_mapping), [LINS](https://github.com/ChaoqinRobotics/LINS---LiDAR-inertial-SLAM) and [Loam_Livox](https://github.com/hku-mars/loam_livox).
+Built on **FAST-LIO2** (W. Xu, Y. Cai, D. He, J. Lin, F. Zhang, HKU-MARS), with **IKFoM**
+and **ikd-Tree**. Relocalization design draws on
+[FAST_LIO_LOCALIZATION](https://github.com/HViktorTsoi/FAST_LIO_LOCALIZATION). Please cite the
+FAST-LIO papers when using this work. See `LICENSE`.

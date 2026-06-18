@@ -1,0 +1,31 @@
+<launch>
+<!-- Honda (Velodyne-32 + /imu/data) relocalization vs the UNIFIED shatin+hkstp map.
+     No rviz, no auto init pose (init pose published externally on /initpose). -->
+
+	<rosparam command="load" file="$(find fastlio_localization)/config/velodyne_honda.yaml" />
+	<rosparam command="load" file="$(find fastlio_localization)/config/localization_unified.yaml" />
+
+	<param name="feature_extract_enable" type="bool" value="0"/>
+	<param name="point_filter_num" type="int" value="3"/>
+	<param name="max_iteration" type="int" value="3" />
+	<param name="filter_size_surf" type="double" value="0.5" />
+	<param name="filter_size_map" type="double" value="0.5" />
+	<param name="cube_side_length" type="double" value="1000" />
+	<param name="runtime_pos_log_enable" type="bool" value="0" />
+	<node pkg="fastlio_localization" type="fastlio_mapping" name="laserMapping" output="screen" />
+
+	<group ns="backend">
+		<param name="enable" value="true"/>
+		<param name="min_local_points" value="1000"/>
+		<param name="min_local_radius" value="20.0"/>
+		<param name="min_frames" value="100"/>
+		<param name="submap_radius" value="20.0"/>
+		<param name="submap_voxel_size" value="0.3"/>
+		<param name="update_interval" value="1"/>
+		<param name="max_point2plane_dist" value="3"/>
+		<param name="global_residual_weight" value="6"/>
+		<param name="max_global_points" value="2000"/>
+		<param name="continuous_align_enable" value="true"/>
+		<param name="continuous_align_stride" value="1"/>
+	</group>
+</launch>
